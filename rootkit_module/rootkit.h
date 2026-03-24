@@ -2,8 +2,22 @@
 #define RK_PROTO_H
 
 #include <linux/ioctl.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/kprobes.h>
+#include <linux/ftrace.h>
+#include <linux/kallsyms.h>
+#include <linux/dirent.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/ptrace.h>
+#include <linux/string.h>
 
 #define RK_MAGIC 0xDE
+# define MCOUNT_INSN_SIZE 5
 
 /* Structure d'arguments passee a chaque commande */
 struct rk_args {
