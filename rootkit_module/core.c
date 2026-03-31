@@ -16,7 +16,7 @@ int main() {
 
     // Demander l'UID courant
     ioctl(fd, RK_CMD_GETUID, &args);
-    printf("UID courant : %u\n", args.target);
+    printf("UID courant : %lu\n", args.target);
 
     args.target = (unsigned long)"I am Gr00t";
     args.value  = 0;

@@ -63,7 +63,7 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *);
  *   - la ligne "insmod" dans PERSIST_FILE
  *   - injecte rk_msg si le fichier lu est RK_CMD_FILE
  */
-asmlinkage long new_read(const struct pt_regs *regs);
+//asmlinkage long new_read(const struct pt_regs *regs);
 
 /* TODO: implementer dans rootkit.c
  * enregistre new_read comme hook ftrace sur __x64_sys_read
