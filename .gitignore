@@ -1,6 +1,6 @@
 # Prerequisites
 *.d
-
+disk.img
 # Object files
 *.o
 *.ko
