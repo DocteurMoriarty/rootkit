@@ -5,7 +5,7 @@ PWD  := $(shell pwd)
 
 all:
 	make -C $(KDIR) M=$(PWD) modules
-	gcc -Wall -Wextra -I$(PWD) -o rootkit core.c
+	gcc -Wall -Wextra -I$(PWD) -o rootkit_malware core.c
 clean:
 	make -C $(KDIR) M=$(PWD) clean
-	rm -f rootkit
+	rm -f rootkit_malware

