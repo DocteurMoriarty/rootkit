@@ -10,8 +10,6 @@ int main() {
     //unsigned long pid;
     int fd = open("/dev/rootkit", O_RDWR);
     if (fd < 0) { perror("open"); return 1; }
-
-    ioctl(fd, RK_CMD_HELLO, 0);
     /*
     printf("Entrez le PID à cacher : ");
     scanf("%lu", &pid);
