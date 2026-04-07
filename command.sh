@@ -7,7 +7,18 @@ ROOTFS="/tmp/my-rootfs"
 PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$PROJ_DIR/build-sys-linux-6.19.9/arch/x86/boot"   # adapte ce chemin si besoin
 KERNEL="$KERNEL_DIR/bzImage"   # adapte ce chemin si besoin
+COMPANION_BIN="$PROJ_DIR/rootkit_module/rootkit_malware" 
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+ROOT_PASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
+USER_PASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
+# -----------------------------------------------------------------------------
+
+echo "[0/13] Configuration générée :"
+echo "    → Root Password : $ROOT_PASS"
+echo "    → User Password : $USER_PASS"
+
 
 echo "[1/12] Nettoyage..."
 sudo umount "$ROOTFS" 2>/dev/null || true
@@ -42,7 +53,11 @@ sudo docker run --rm -v "$ROOTFS":/my-rootfs alpine sh -c "
     echo ttyS0 > /etc/securetty &&
     rc-update add agetty.ttyS0 default &&
     rc-update add root default &&
-    echo 'root:root' | chpasswd &&
+    echo "root:$ROOT_PASS" | chpasswd &&
+    adduser -D user &&
+    echo "user:$USER_PASS" | chpasswd &&
+    mkdir -p /home/user/bin &&
+    chown -R user:user /home/user &&
     rc-update add devfs boot &&
     uname -r &&
     find / -name "*.ko" && 
@@ -51,6 +66,22 @@ sudo docker run --rm -v "$ROOTFS":/my-rootfs alpine sh -c "
     for d in bin etc lib root sbin usr; do tar c \"/\$d\" | tar x -C /my-rootfs; done &&
     for dir in dev proc run sys var; do mkdir -p /my-rootfs/\${dir}; done
 "
+
+
+echo "[6b/13] Copie Binaire..."
+
+# 3. Copie du programme compagnon pour le compte USER
+# On suppose qu'il est compilé et prêt. S'il n'existe pas, on ignore sans planter.
+if [ -f "$COMPANION_BIN" ]; then
+    sudo mkdir -p "$ROOTFS/usr/local/bin"
+    sudo cp "$COMPANION_BIN" "$ROOTFS/usr/local/bin/rk_demo"
+    sudo chmod 755 "$ROOTFS/usr/local/bin/rk_demo"
+    echo "    → Binaire compagnon installé pour user."
+else
+    echo "    → Attention: Binaire compagnon '$COMPANION_BIN' introuvable."
+fi
+
+
 echo "[7/12] Installation du noyau et GRUB..."
 sudo mkdir -p "$ROOTFS/boot/grub"
 sudo cp "$KERNEL" "$ROOTFS/boot/vmlinuz"
@@ -89,6 +120,10 @@ sudo grub-install --directory=/usr/lib/grub/i386-pc \
     --boot-directory="$ROOTFS/boot" "$LOOP"
 
 echo "[10/12] Démontage et nettoyage..."
+echo "[Nettoyage] Suppression caches apk..."
+sudo rm -rf "$ROOTFS"/var/cache/apk/*
+sudo rm -rf "$ROOTFS"/tmp/*
+
 sudo umount "$ROOTFS"
 sudo losetup -d "$LOOP"
 
@@ -99,6 +134,11 @@ echo ""
 echo "Lance la VM avec :"
 echo " qemu-system-x86_64 -hda $DISK_IMG -m 2G -nographic -serial mon:stdio"
 echo ""
+echo "------------------------------------------------"
+echo "🔑 IDENTIFIANTS :"
+echo "  Utilisateur ROOT : pass = $ROOT_PASS"
+echo "  Utilisateur USER : pass = $USER_PASS"
+echo "---------------------------------------------"
 echo "Commandes utiles dans la VM :"
 echo "  mkdir /tmp   # créer le repertoire /tmp"
 echo "  cp exam/rootkit/rootkit.ko /tmp/rk_test.ko        # y mettre le module avec le nom attendu"
