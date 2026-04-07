@@ -127,17 +127,6 @@ Filtre les lectures de `/etc/passwd` et `/etc/shadow` pour supprimer les lignes 
 ---
 
 ### 8. Escalade de privileges
-
-Deux methodes d'escalade :
-
-#### Par PID
-Utilise `prepare_kernel_cred(NULL)` et `commit_creds()` pour donner les privileges root a un processus specifique.
-
-```bash
-./rootkit_malware privesc_pid 1234
-```
-
-#### Par commande
 Execute une commande arbitraire en tant que root via `call_usermodehelper()`.
 
 ```bash
