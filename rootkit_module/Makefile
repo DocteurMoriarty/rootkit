@@ -1,6 +1,7 @@
 obj-m += rootkit.o
 
-KDIR := /lib/modules/$(shell uname -r)/build
+KDIR := /home/ash/Downloads/kernel/exam/rootkit/build-sys-linux-6.19.9/
+
 PWD  := $(shell pwd)
 
 # eBPF
