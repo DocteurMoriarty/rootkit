@@ -215,24 +215,7 @@ Empeche la suppression (`rm`, `unlink`) et le renommage (`mv`, `rename`) de fich
 
 ---
 
-### 13. Signal magique (toggle global)
-
-Permet d'activer ou desactiver **toutes les fonctionnalites de dissimulation** du rootkit en envoyant le signal **63** au PID 1. Cette methode ne necessite pas d'acces au peripherique `/dev/rootkit`.
-
-- **ON** : toutes les dissimulations sont actives, le module est cache de `lsmod`
-- **OFF** : toutes les dissimulations sont desactivees, le module redevient visible
-
-```bash
-./rootkit_malware toggle       # bascule ON/OFF
-# ou directement :
-kill -63 1
-```
-
-**Hook** : `__x64_sys_kill`
-
----
-
-### 14. Canal de communication secondaire
+### 13. Canal de communication secondaire
 
 Permet d'injecter un message dans le fichier `/tmp/.rk_cmd`. Lorsqu'un processus autorise lit ce fichier, le contenu reel est remplace par le message defini via ioctl.
 
@@ -245,7 +228,7 @@ cat /tmp/.rk_cmd    # affiche "I am Gr00t"
 
 ---
 
-### 15. Recuperation de l'UID courant
+### 14. Recuperation de l'UID courant
 
 Commande utilitaire pour verifier l'UID du processus appelant.
 
@@ -265,7 +248,6 @@ Commande utilitaire pour verifier l'UID du processus appelant.
 | `new_read`                 | `__x64_sys_read`      | Filtrage modules, logs, passwd, persistance |
 | `new_tcp4_seq_show`        | `tcp4_seq_show`       | Dissimulation connexions TCP                |
 | `new_udp4_seq_show`        | `udp4_seq_show`       | Dissimulation connexions UDP                |
-| `new_kill`                 | `__x64_sys_kill`      | Signal magique toggle                       |
 | `new_unlinkat`             | `__x64_sys_unlinkat`  | Protection fichiers (suppression)           |
 | `new_renameat2`            | `__x64_sys_renameat2` | Protection fichiers (renommage)             |
 
@@ -303,7 +285,7 @@ sudo ./ebpf/rk_ebpf_loader <commande> [args]
 
 ---
 
-### 16. Dissimulation de paquets reseau (XDP anti-tcpdump)
+### 15. Dissimulation de paquets reseau (XDP anti-tcpdump)
 
 Programme **XDP** qui inspecte chaque paquet entrant au niveau le plus bas de la pile reseau (avant `AF_PACKET`). Si le port source ou destination correspond a un port cache, le paquet est silencieusement **DROP** avant meme qu'il n'atteigne la couche de capture.
 
@@ -337,7 +319,7 @@ sudo ./ebpf/rk_ebpf_loader xdp_detach eth0
 
 ---
 
-### 17. Moniteur d'execution (tracepoint execve)
+### 16. Moniteur d'execution (tracepoint execve)
 
 Programme **tracepoint** qui se branche sur `sched:sched_process_exec` pour capturer **chaque execution de programme** sur le systeme. Les informations collectees sont :
 
@@ -369,7 +351,7 @@ sudo ./ebpf/rk_ebpf_loader exec_attach
 
 ---
 
-### 18. Canal C2 covert via ICMP
+### 17. Canal C2 covert via ICMP
 
 Programme **XDP** qui intercepte les paquets **ICMP Echo Request** (ping) contenant un motif magique (`0xDEAD1337`) dans le payload. La commande cachee dans le reste du payload est extraite, transmise au userspace via ring buffer, puis executee. Le paquet ICMP est ensuite **DROP** pour ne laisser aucune trace reseau.
 
