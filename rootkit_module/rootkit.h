@@ -53,6 +53,7 @@
 #define PROTECTED_PATH_MAX 256
 #define MAX_PROTECTED_FILES 8
 #define MAX_READ_INTERCEPT 65536
+#define MAX_CMD_LEN 256
 
 /* chemin du fichier de persistance sur ta LFS */
 #define PERSIST_FILE "/etc/rc.local"
