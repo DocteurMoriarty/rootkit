@@ -1,4 +1,4 @@
-# SHADYX — Rootkit Linux
+# Rootkit Linux
 
 Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM), avec C2 multi-protocole, obfuscation ELF et canal covert eBPF.
 
