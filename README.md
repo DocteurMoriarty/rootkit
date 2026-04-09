@@ -7,7 +7,16 @@ Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM),
 ---
 
 ## Auteurs
-
+**Alberick Mahoussi**
+-  Développement de la structure de base du module et moteur de hooking (ftrace + kprobes)
+-  Mise en place de la première méthode de communication entre le rootkit et les programmes compagnons par la création d'un périphérique avec misc
+-  hooking des syscalls(``new_getdents64``, ``new_tcp4_seq_show``, `new_read`)
+-  Implémentation du système de communication ioctl
+-  Exécution d'une commande avec les droits root (privesc)
+-  Masque d'un processus (hide pid)
+-  Mise en place d'une backdoor par mise en place d'un socket TCP sur un port donnée et obtention d'un shell après vérification password 
+-  Correction des bugs et refactor du code selon le coding style de l'ANSSI
+  
 **Mohand ACHERIR**
 - Hooking de syscalls (ftrace + kprobes)
 - Mécanismes de dissimulation : processus, fichiers, module, réseau, logs, utilisateurs
@@ -24,6 +33,13 @@ Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM),
 - Pipeline de build automatisé : compilation cross-kernel, nommage aléatoire
 - Documentation et environnement de test (VM Alpine, disque partagé)
 
+**Vignon HOUETO**
+- Manipulation du système de fichiers depuis l'espace noyau via les primitives VFS
+- Hijack de module légitime(binfmt_misc) permettant le camouflage
+- Détournement de modprobe pour chargement au démarage 
+- Indempotence et auto réparation si suppression de la persistence
+- Dynamisation et développement du script d’automatisation de génération de la LFS et peuplement
+- Mise en place des comptes utilisateurs (root / user) et configuration système
 ---
 
 ## Architecture
