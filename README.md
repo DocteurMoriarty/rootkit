@@ -4,12 +4,12 @@ Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM),
 
 **Architecture** : x86-64 — **Interface** : `/dev/rootkit` (ioctl) + BPF maps
 
-**NB**: Ce projet a été développé dans le **cadre des recherches personnelles et sécurisé selon les normes de l'ANSSI**.
-L'**usage abusif pour des raisons personnelles sera à vos risques**.
-
 # Disclaimer — Educational & Research Use Only
 
 This project is a **Linux rootkit prototype** developed strictly in the context of an **academic offensive security course**. It is intended to demonstrate low-level kernel mechanisms (LKM hooking, eBPF, covert channels) for **educational purposes only**.
+
+Ce projet a été développé dans le **cadre des recherches personnelles et sécurisé selon les normes de l'ANSSI**.
+L'**usage abusif pour des raisons personnelles sera à vos risques**.
 
 ---
 
