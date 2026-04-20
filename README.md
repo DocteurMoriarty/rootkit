@@ -4,9 +4,65 @@ Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM),
 
 **Architecture** : x86-64 — **Interface** : `/dev/rootkit` (ioctl) + BPF maps
 
-
 **NB**: Ce projet a été développé dans le **cadre des recherches personnelles et sécurisé selon les normes de l'ANSSI**.
 L'**usage abusif pour des raisons personnelles sera à vos risques**.
+
+# Disclaimer — Educational & Research Use Only
+
+This project is a **Linux rootkit prototype** developed strictly in the context of an **academic offensive security course**. It is intended to demonstrate low-level kernel mechanisms (LKM hooking, eBPF, covert channels) for **educational purposes only**.
+
+---
+
+## Legal Notice
+
+- This software is provided **for research and learning purposes exclusively**.
+- **Do not deploy** this code on any system you do not own or have explicit written authorization to test.
+- Unauthorized use of this software against real systems may violate laws including but not limited to:
+  - The **Computer Fraud and Abuse Act (CFAA)** (United States)
+  - The **EU Directive on Attacks Against Information Systems (2013/40/EU)** (European Union)
+  - **Article 323-1 et seq. of the French Penal Code** (France)
+  - And all equivalent national legislation in your jurisdiction.
+- The authors **do not condone** and are **not responsible** for any malicious, illegal, or unauthorized use of this code.
+
+---
+
+## Intended Use
+
+This project was built and is shared solely for the following purposes:
+
+- Study of Linux kernel internals and LKM (Loadable Kernel Module) development
+- Understanding offensive techniques for **defensive purposes** (blue team, malware analysis, EDR/XDR research)
+- Academic coursework and Capture The Flag (CTF) environments
+- Testing exclusively in **isolated, controlled lab environments** (local VMs with no external network exposure)
+
+---
+
+## Conditions of Use
+
+By accessing, cloning, or using this repository, you agree that:
+
+1. You will **only run this code** in a fully isolated environment (local VM, no internet-facing interface).
+2. You will **not use** any component of this project to gain unauthorized access to any system, network, or device.
+3. You are **solely responsible** for ensuring your use complies with all applicable laws in your jurisdiction.
+4. You will **not redistribute** modified versions of this project for malicious purposes.
+
+---
+
+## No Warranty
+
+This software is provided **as-is**, without warranty of any kind, express or implied.
+
+> Running kernel modules carries significant risk. A bug in a LKM can **panic, corrupt, or permanently damage** the host system. The authors accept **no liability** for any damage — direct or indirect — caused by the use or misuse of this project.
+
+---
+
+## Responsible Disclosure
+
+If you identify a novel technique or vulnerability demonstrated in this project that could have broader security implications, please consider following responsible disclosure practices and notifying affected vendors before any public release.
+
+---
+
+*This disclaimer applies to all files, scripts, binaries, and documentation contained in this repository.*
 
 ---
 
