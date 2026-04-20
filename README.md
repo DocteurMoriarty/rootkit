@@ -3,6 +3,8 @@
 Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM), avec C2 multi-protocole, obfuscation ELF et canal covert eBPF.
 
 **Architecture** : x86-64 — **Interface** : `/dev/rootkit` (ioctl) + BPF maps
+
+
 **NB**: Ce projet a été développé dans le **cadre des recherches personnelles et sécurisé selon les normes de l'ANSSI**.
 L'**usage abusif pour des raisons personnelles sera à vos risques**.
 
