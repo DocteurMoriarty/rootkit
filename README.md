@@ -25,7 +25,7 @@ Projet de sécurité offensive : rootkit Linux sous forme de module noyau (LKM),
 - Programmes eBPF : XDP (filtrage réseau, C2 covert) + tracepoints (exec monitor)
 - Interface userspace : ioctl + gestion via BPF maps
 
-**Sacha MORISSET-LARRE**
+**Dr Shadyx**
 - Obfuscation des strings sensibles (XOR compile-time, macro `DEOBFS`)
 - C2 interactif multi-protocole (TCP, ICMP, HTTP, DNS) avec REPL
 - Dropper : connexion au C2, réception du .ko, chargement via `finit_module`
